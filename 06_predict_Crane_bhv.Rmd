@@ -1,0 +1,568 @@
+---
+title: "BigData_Wetland_migratoryBirds"
+author: "Youn Jae Kang"
+date: "2026-04-16"
+output: html_document
+---
+
+What factor of a wetland affects migratory birds? and if the factor changes in the future, how will behaviour change?
+
+```{r load package, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ranger)
+library(tidyverse)
+library(lubridate)
+library(momentuHMM)
+```
+
+```{r}
+hmm_model <- readRDS("/Users/yjkang/Desktop/NIE_BigData/Dyn_Crane_HMM.rds")
+#print(hmm_model)
+```
+
+```{r}
+# map future data & normalise
+future_env <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/future_env_2031_2050_30min.csv")
+future_covs <- future_env %>%
+  mutate(
+    Date_Time = as.POSIXct(Date_Time, format="%Y-%m-%dT%H:%M:%SZ", tz="UTC"),
+    In_Hangang = 1, 
+    Han_Temp   = as.numeric(scale(Temperature.C.)),    
+    Han_Wind   = as.numeric(scale(Wind_Speed.m.s.)),
+    Han_SPI6   = as.numeric(scale(SPI6_Smooth)), 
+    Han_wTemp  = as.numeric(scale(Pred_Water_Temp)),   
+    Han_BOD    = as.numeric(scale(Pred_BOD)),
+    Han_DTN    = as.numeric(scale(Pred_DTN)), 
+    Han_Chlor  = as.numeric(scale(Pred_Chlorophyll))
+  ) %>%
+  filter(month(Date_Time) %in% c(10, 11, 12, 1, 2, 3, 4)) %>%
+  select(Station, Date_Time, In_Hangang, Han_Temp, Han_Wind, 
+         Han_wTemp, Han_BOD, Han_Chlor, Han_DTN, Han_SPI6) %>%
+  na.omit()
+```
+
+=======================================
+predict future stationary distribution
+=======================================
+: the long-term expected proportion of being in State 1, 2, or 3 given specific environment.
+extract the $\beta$ (beta) coefficients from your trained model and mathematically calculate the transition matrix for every single hour/day in future dataset.
+
+```{r}
+# Function to calculate the stationary distribution for a single row of covariates
+
+get_stationary_probs <- function(x_row, beta, nbStates) {
+  # Calculate linear predictors (eta)
+  eta <- matrix(x_row %*% beta, nrow = nbStates, ncol = nbStates - 1, byrow = TRUE)
+
+  # Build the transition probability matrix (Gamma)
+  gamma <- matrix(0, nbStates, nbStates)
+  for (i in 1:nbStates) {
+    gamma[i, -i] <- exp(eta[i, ]) # multinomial logit back-transformation
+    gamma[i, i] <- 1
+  }
+  # Normalize rows to sum to 1
+  gamma <- gamma / rowSums(gamma) 
+  
+  # Stabilised equilibrium (stationary distribution) of Markov chain.
+  # calculate the eigenvectors of the transposed matrix and isolate the one associated with an eigenvalue of 1.
+  eigen_res <- eigen(t(gamma))
+  idx <- which.min(abs(eigen_res$values - 1))
+  stat_dist <- Re(eigen_res$vectors[, idx])
+  
+  # ensure that final three probabilities (Traveling, Foraging, Roosting) sum to 1.
+  stat_dist <- stat_dist / sum(stat_dist)
+  return(stat_dist)
+}
+```
+
+```{r}
+#future data matched to historical dates
+match_date_df <- hmm_model$data %>%
+  mutate(match_key = roundT + years(20)) %>% 
+  select(Station, roundT, match_key)
+match_future <- match_date_df %>%
+  left_join( future_covs %>% mutate(match_key = as.POSIXct(Date_Time)), 
+             by = c("match_key", "Station"))  %>%
+  select(-roundT, -match_key)
+```
+
+```{r}
+# Extract beta coefficients from the trained model
+beta_coeffs <- hmm_model$mle$beta
+nbStates <- 3
+
+# Create a design matrix from the future covariates using your exact formula
+cov_formula <- ~ Han_Temp + Han_Wind + Han_wTemp + Han_BOD + Han_Chlor + Han_DTN + Han_SPI6
+X <- model.matrix(cov_formula, data = match_future) #match_future, future_covs
+
+# Identify and fix missing columns (e.g., if a factor level is missing in the future data)
+missing_cols <- setdiff(rownames(beta_coeffs), colnames(X))
+if(length(missing_cols) > 0) {
+  message("Fixing missing columns: ", paste(missing_cols, collapse = ", "))
+  for(col in missing_cols) {
+    X <- cbind(X, 0) # Fill missing dummy variables with 0
+    colnames(X)[ncol(X)] <- col
+  }
+}
+# warn about extra columns
+extra_cols <- setdiff(colnames(X), rownames(beta_coeffs))
+if(length(extra_cols) > 0) {
+  message("Ignoring extra columns: ", paste(extra_cols, collapse = ", ")) }
+
+# Force X to have the exact same columns, in the exact same order as beta_coeffs
+X <- X[, rownames(beta_coeffs), drop = FALSE]
+
+# get_stationary_probs for every row in the future dataset (this may take a minute)
+future_stat_probs <- t(apply(X, 1, get_stationary_probs, beta = beta_coeffs, nbStates = nbStates))
+colnames(future_stat_probs) <- c("Prob_Traveling", "Prob_Foraging", "Prob_Roosting")
+colMeans(future_stat_probs)
+future_predictions <- cbind(match_future, future_stat_probs) #match_future, future_covs
+
+#plotting format
+long_predictions <- future_predictions %>%
+  pivot_longer(cols = c(Prob_Traveling, Prob_Foraging, Prob_Roosting),
+    names_to = "Behavior",
+    values_to = "Probability") %>%
+  mutate(Behavior = gsub("Prob_", "", Behavior))
+
+# Reshape and clean
+fut_clean <- long_predictions %>%
+  mutate(Date = as.Date(Date_Time)) %>% 
+  # Calculate daily average probability
+  group_by(Date, Behavior) %>%
+  summarize(Probability = mean(Probability), .groups = "drop") %>%
+  mutate(Period = "Future Projection (2031-2050)") %>% #(SSP2-4.5)
+  select(Behavior, Probability, Period)
+```
+
+=======================================
+Historical stationary distribution (2016-2024)
+=======================================
+
+```{r}
+# 1. Subset the historical data to ONLY when they were in the Hangang River
+hist_hangang_data <- hmm_model$data #%>% filter(In_Hangang == 1)
+
+# Extract the covariates from your fitted HMM data
+X_hist <- model.matrix(hmm_model$conditions$formula, data = hist_hangang_data)  #hist_aligned, hist_hangang_data
+hist_stat_probs <- t(apply(X_hist, 1, get_stationary_probs, 
+                           beta = beta_coeffs, nbStates = nbStates))
+colnames(hist_stat_probs) <- c("Prob_Traveling", "Prob_Foraging", "Prob_Roosting")
+colMeans(hist_stat_probs)
+
+hist_stat_df <- data.frame(
+  Date = as.Date(hist_hangang_data$time),   #hist_aligned, hist_hangang_data
+  Foraging = hist_stat_probs[,2],
+  Roosting = hist_stat_probs[,3],
+  Traveling = hist_stat_probs[,1] )
+
+# Reshape and clean
+hist_stat_clean <- hist_stat_df %>%
+  pivot_longer(cols = c(Foraging, Roosting, Traveling), 
+               names_to = "Behavior", values_to = "Probability") %>%
+  group_by(Date, Behavior) %>%
+  summarize(Probability = mean(Probability), .groups = "drop") %>%
+  mutate(Period = "Historical Tracks (2016-2024)")
+```
+
+```{r, fig.width=5.3, fig.height=2.7}
+combined_pure_comparison <- bind_rows(hist_stat_clean, fut_clean) %>%
+  mutate(Period = factor(Period, levels = c("Historical Tracks (2016-2024)","Future Projection (2031-2050)")), 
+         Behavior = factor(Behavior, levels = c("Traveling", "Foraging", "Roosting")) )
+
+p<-ggplot(combined_pure_comparison, aes(x = Period, y = Probability, fill = Period, color = Period)) +
+  geom_violin(alpha = 0.4, trim = TRUE, linewidth = 0.8, adjust = 1.5) +
+  geom_jitter(width = 0.4, alpha = 0.2, size = 0.5, shape=16) +
+  stat_summary(fun = "mean", geom = "crossbar", width = 0.3, color = "grey10", linewidth = 0.2) +
+  facet_wrap(~ Behavior, ncol = 3, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0.08, 0.39))) +
+  labs(title = "Shift in Crane Wintering Behavior Probabilities",
+       x = NULL, 
+       y = "Expected Proportion\n(stationary probability)",
+       fill = "Data Source",
+       color = "Data Source") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Historical Tracks (2016-2024)" = "gray50", 
+                               "Future Projection (2031-2050)" = "#0072B2")) +
+  scale_color_manual(values = c("Historical Tracks (2016-2024)" = "gray30", 
+                                "Future Projection (2031-2050)" = "#005580")) + #005580
+  theme(legend.position = "bottom", legend.title = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"), axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank(), plot.title = element_text(size = 13, hjust = 0.5))
+print(p)
+#ggsave("/Users/yjkang/Desktop/hist_fut_prob.pdf", plot=p, height=2.7, width=5.3)
+```
+
+===================================
+Stat test: is change meaningful?
+===================================
+1. Smithson & Verkuilen (2006) transformation to prepare bounded data. Beta regression crashes if it sees exactly 0 or exactly 1. Transformation squeezes the exact 0s and 1s slightly inward [e.g., 0.001 and 0.999] so the math works.
+2. Beta Regression to respect the strict 0-1 boundaries of stationary probabilities.
+3. Wald chi-square test to prove a global interaction effect exists.
+4. Estimated Marginal Means conditional contrasts to isolate the exact behavior-specific shifts.
+
+```{r}
+library(betareg)
+combined_pure_comparison <- combined_pure_comparison %>%
+  mutate(Prob_Trans = (Probability * (n() - 1) + 0.5) / n()) 
+fit <- betareg(Prob_Trans ~ Period*Behavior, data = combined_pure_comparison)
+               #data = filter(combined_pure_comparison, Behavior == "Foraging"))
+summary(fit)
+print("------------------------------------")
+
+library(emmeans)
+joint_tests(fit)
+print("------------------------------------")
+
+post_hoc <- emmeans(fit, ~ Period | Behavior) #Estimated Marginal Means
+pairs(post_hoc)
+```
+---------------------------------------------------------------------------------------------------------------------------------------
+
+==========================
+Simulate Future Sequences: Virtual Winter
+==========================
+simulate actual sequence of behaviors (e.g., how long do they spend foraging continuously under future weather?)
+```{r}
+cols_to_drop <- c("ID","x", "y", "step", "angle", "Predicted_State","TimeNum")
+
+#find the longest consecutive dates in the historical data.
+df_grouped <- hist_hangang_data %>%
+  mutate(roundT = as.POSIXct(roundT, format="%Y-%m-%d %H:%M:%S")) %>%
+  arrange(roundT) %>%
+  select(-any_of(cols_to_drop)) %>% 
+  drop_na() %>% as.data.frame() %>%
+  mutate(
+    diff_hours = as.numeric(difftime(roundT, lag(roundT), units = "hours")),
+    # A new group starts if it's the first row (NA) or if gap != 1
+    new_group_flag = ifelse(is.na(diff_hours) | diff_hours != 1, 1, 0),
+    group_id = cumsum(new_group_flag)
+  )
+# Find the ID of the longest group ---
+longest_group_id <- df_grouped %>%
+  group_by(group_id) %>%
+  summarise(count = n()) %>%
+  filter(count == max(count)) %>%
+  pull(group_id) %>%
+  first() # In case of a tie, take the first one
+# Extract the actual chunk ---
+longest_chunk <- df_grouped %>%
+  filter(group_id == longest_group_id) %>%
+  select(-diff_hours, -new_group_flag, -group_id) #filter the grouped data for that ID and remove our helper columns
+```
+
+```{r}
+hist_aligned <- hist_hangang_data %>% 
+  mutate(time = as.POSIXct(time), 
+         Date_Time=roundT, 
+         match_key = Date_Time + years(20) ) %>%
+  arrange(time) %>% # Ensure chronological order
+  select(-any_of(cols_to_drop)) %>% distinct(Date_Time, .keep_all = TRUE) %>%
+  drop_na() %>% as.data.frame() %>%
+  mutate(step_idx = row_number()) #%>% #create a step index to track the chronological sequence
+  #slice(3553:4365) #longest consecutive dates
+
+fut_aligned <- hist_aligned %>%
+  select(step_idx, Station, match_key) %>% # Take the exact sequence of Stations
+  #rbind( future_covs[(1:10079), ],future_covs[(203689:213793), ])
+  left_join( future_covs %>% mutate(match_key = as.POSIXct(Date_Time)), 
+             by = c("match_key", "Station")) %>%
+  arrange(Date_Time) %>% 
+  select(-any_of(cols_to_drop)) %>% distinct(Date_Time, .keep_all = TRUE) %>% 
+  drop_na() %>% as.data.frame()
+```
+
+```{r}
+indices_by_year <- split(1:nrow(hist_aligned), year(hist_aligned$time))
+print(names(indices_by_year))
+sample(names(indices_by_year), size = 1)
+#indices_by_year[[sample(names(indices_by_year), size = 1)]]
+```
+
+```{r}
+set.seed(78910)  #678 #68
+n_steps <- indices_by_year[["2023"]] #single winter
+
+# Simulate Historical Sequences (Hangang-only)
+hist_sim <- simData(model = hmm_model, 
+                    covs = hist_aligned[n_steps, ] %>% select(-any_of(cols_to_drop)) %>% drop_na() %>% as.data.frame(), 
+                    obsPerAnimal = length(n_steps), states = TRUE)
+# Simulate Future Sequences (Hangang-only)
+future_sim <- simData(model = hmm_model, 
+                      covs = fut_aligned[n_steps, ] %>% select(-any_of(cols_to_drop)) %>% drop_na() %>% as.data.frame(), 
+                      obsPerAnimal = length(n_steps), states = TRUE)
+
+hist_spatial_df <- as.data.frame(hist_sim) %>%
+  mutate(Period = "Historical regime")
+fut_spatial_df <- as.data.frame(future_sim) %>%
+  mutate(Period = "Future regime")
+
+combined_spatial <- bind_rows(hist_spatial_df, fut_spatial_df)
+combined_spatial <- combined_spatial %>%
+  mutate(Behavior = case_when(
+    states == 1 ~ "Traveling",
+    states == 2 ~ "Foraging",
+    states == 3 ~ "Roosting"),
+  Behavior = factor(Behavior, levels = c("Traveling", "Foraging", "Roosting")),
+  Period = factor(Period, levels = c("Historical regime", "Future regime")))
+```
+
+```{r}
+g<-ggplot(combined_spatial, aes(x = x, y = y)) +
+  geom_path(color = "dodgerblue3", alpha = 0.7, linewidth=0.5) +
+  geom_point(aes(color = Behavior), size = 0.8, alpha = 0.8, shape=16) +
+  facet_wrap(~ Period) + theme_minimal() +
+  coord_equal(xlim = c(-270, 270), ylim = c(-270, 210)) +
+  scale_color_manual(values = c("Traveling" = NA, "Foraging" = "orangered2", "Roosting" = "grey10")) +
+  labs(title = "Simulated Winter Trajectories", x = "Easting (km)", y = "Northing (km)") +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank(), plot.title = element_text(size = 17, hjust = 0.5),
+        strip.text = element_text(size = 15, face = "bold"),
+        panel.border = element_rect(color = "gray80", fill = NA, linewidth = 1), panel.spacing = unit(0.5, "lines"))
+print(g)
+#ggsave("/Users/yjkang/Desktop/sim_traj.pdf", plot = g)
+```
+
+```{r}
+library(gganimate)
+library(gifski)
+
+combined_spatial <- combined_spatial %>%
+  group_by(Period) %>%
+  mutate(step = row_number()) %>%  # add sequential 'step' variable to synchronize the animation
+  ungroup()
+
+trajectory_plot <- ggplot(combined_spatial, aes(x = x, y = y, color = Behavior)) +
+  geom_path(aes(group = Period), alpha = 0.2, size = 0.5, color = "dodgerblue3", linewidth=0.2) +
+  geom_point(aes(group = step), size = 0.5) +
+  facet_wrap(~ Period, ncol = 2) +
+  coord_equal(xlim = c(-270, 270), ylim = c(-270, 210)) +
+  scale_color_manual(values = c("Traveling" = "dodgerblue3", 
+                                "Foraging" = "orangered2", 
+                                "Roosting" = "grey10")) +
+  theme_minimal() +
+  labs(title = 'Simulated Winter Trajectories | Step: {frame_along}',
+       x = 'X', y = 'Y', color = 'Behavior State') +
+  theme(legend.position = "bottom",
+        strip.text = element_text(size = 12, face = "bold"))
+
+# transition_reveal keeps the historical path visible as the point moves forward
+animated_plot <- trajectory_plot + 
+  transition_reveal(step) + shadow_mark(past = TRUE, future = FALSE, alpha = 0.3)
+
+anim_save("/Users/yjkang/Desktop/winter_simulation_traj.gif", 
+          animation = animated_plot, renderer = gifski_renderer(),
+          width = 800,  height = 500, res = 100, 
+          nframes = 200, # Adjust based on the length of n_steps
+          fps = 10)      # Frames per second
+```
+
+repeat simulations to estimate range of bout values.
+```{r}
+set.seed(78910) 
+
+# Calculate Continuous Bout Lengths (Run Length Encoding)
+calculate_bouts <- function(df) {
+  runs <- rle(as.character(df$Behavior)) #rle() collapses "Forage, Forage, Forage, Roost" into "Forage for 3 steps, Roost for 1 step".
+  data.frame(
+    Behavior = runs$values,
+    Bout_Length_Steps = runs$length,
+    Bout_Duration_Mins = runs$lengths * 60 )  # actual GPS fix interval, 60 min.
+}
+
+n_simulations <- 100 
+results_list <- list() # Empty list to store each iteration's summary
+
+# simulation Loop
+for (i in 1:n_simulations) {
+  # A. Run Simulations (using your aligned data and final_steps)
+  final_steps <- indices_by_year[[sample(names(indices_by_year), size = 1)]] #single year
+  h_sim <- simData(model = hmm_model, 
+                   covs = hist_aligned[final_steps, ], 
+                   obsPerAnimal = length(final_steps), states = TRUE)
+  f_sim <- simData(model = hmm_model, 
+                   covs = fut_aligned[final_steps, ], 
+                   obsPerAnimal = length(final_steps), states = TRUE)
+  
+  # B. Combine and Label Behaviors
+  comb <- bind_rows(as.data.frame(h_sim) %>% mutate(Period = "Historical (2016-2024)"),
+                    as.data.frame(f_sim) %>% mutate(Period = "Future Projection (2031-2050)")) %>%
+    mutate(Behavior = case_when(
+      states == 1 ~ "Traveling",
+      states == 2 ~ "Foraging",
+      states == 3 ~ "Roosting"),
+    Behavior = factor(Behavior, levels = c("Traveling", "Foraging", "Roosting")),
+    Period = factor(Period, levels = c("Historical (2016-2024)", "Future Projection (2031-2050)")))
+  
+  # C. Calculate Bouts
+  h_bouts <- calculate_bouts(comb %>% filter(Period == "Historical (2016-2024)")) %>% 
+    mutate(Period = "Historical (2016-2024)")
+  f_bouts <- calculate_bouts(comb %>% filter(Period == "Future Projection (2031-2050)")) %>% 
+    mutate(Period = "Future Projection (2031-2050)")
+  
+  # D. Summarize this specific iteration and add to list
+  iter_summary <- bind_rows(h_bouts, f_bouts) %>%
+    group_by(Period, Behavior) %>%
+    summarize(
+      Total_Steps = length(final_steps),
+      Mean_Duration_Mins = mean(Bout_Duration_Mins),
+      Bout_Rate_per_Winter = n()/length(final_steps)*24, #bouts per day
+      Total_Number_of_Bouts = n(),
+      .groups = "drop") %>%
+    mutate(Simulation_ID = i) # Tag with the run number
+  results_list[[i]] <- iter_summary
+}
+
+# Combine all iterations into one master dataframe
+all_sim_results <- bind_rows(results_list)
+```
+
+```{r}
+grand_bout_summary <- all_sim_results %>%
+  group_by(Period, Behavior) %>%
+  summarize(
+    Robust_Mean_Duration = mean(Mean_Duration_Mins),
+    SD_Mean_Duration = sd(Mean_Duration_Mins),
+    Robust_Mean_Total_Bouts = mean(Total_Number_of_Bouts),
+    SD_Total_Bouts = sd(Total_Number_of_Bouts),
+    # 95% Confidence Intervals for Duration
+    CI_Lower = Robust_Mean_Duration - (1.96 * SD_Mean_Duration),
+    CI_Upper = Robust_Mean_Duration + (1.96 * SD_Mean_Duration),
+    .groups = "drop"  )
+print(grand_bout_summary)
+```
+
+```{r, fig.width=5.3, fig.height=3}
+plot_data <- all_sim_results %>%
+  mutate(
+    Period = case_when(
+      str_detect(Period, "Historical") ~ "Historical (2016-2024)",
+      str_detect(Period, "Future") ~ "Future (2031-2050)" ),
+    Period = factor(Period, levels = c("Historical (2016-2024)", "Future (2031-2050)")),
+    Behavior = factor(Behavior, levels = c("Traveling", "Foraging", "Roosting"))
+  )
+
+plot_duration <- ggplot(plot_data, aes(x = Period, y = Mean_Duration_Mins, fill = Period, color = Period)) +
+  geom_violin(alpha = 0.4, trim = TRUE, linewidth = 0.8, adjust = 1.5) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 0.5, shape = 16) +
+  stat_summary(fun = "mean", geom = "crossbar", width = 0.3, color = "grey10", linewidth = 0.2) +
+  facet_wrap(~ Behavior, ncol = 3, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0.38, 0.39))) +
+  labs(title = "Shift in Crane Wintering Bouts",
+       x = NULL, 
+       y = "Mean Bout Duration (min)",
+       fill = NULL, color = NULL) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Historical Tracks (2016-2024)" = "gray50", 
+                               "Future Projection (2031-2050)" = "#0072B2")) +
+  scale_color_manual(values = c("Historical Tracks (2016-2024)" = "gray30", 
+                                "Future Projection (2031-2050)" = "#005580")) +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"), 
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank(), 
+        plot.title = element_text(size = 13, hjust = 0.5))
+print(plot_duration)
+#ggsave("/Users/yjkang/Desktop/bout_dur.pdf", plot = plot_duration)
+
+plot_bouts <- ggplot(plot_data, aes(x = Period, y = Bout_Rate_per_Winter, fill = Period, color = Period)) +
+  geom_violin(alpha = 0.4, trim = TRUE, linewidth = 0.8, adjust = 1.5) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 0.5, shape = 16) +
+  stat_summary(fun = "mean", geom = "crossbar", width = 0.3, color = "grey10", linewidth = 0.2) +
+  facet_wrap(~ Behavior, ncol = 3, scales = "free_y") +
+  scale_y_continuous(expand = expansion(mult = c(0.36, 0.36))) +
+  labs(title = "Shift in Crane Wintering Bout Frequencies",
+       x = NULL, 
+       y = "Bouts per Day",
+       fill = NULL, color = NULL) +
+  theme_minimal() +
+  scale_fill_manual(values = c("Historical (2016-2024)" = "gray50", 
+                               "Future (2031-2050)" = "#0072B2")) +
+  scale_color_manual(values = c("Historical (2016-2024)" = "gray30", 
+                                "Future (2031-2050)" = "#005580")) +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank(),
+        strip.text = element_text(size = 12, face = "bold"), 
+        axis.text.x = element_blank(), 
+        axis.ticks.x = element_blank(), 
+        panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank(), 
+        plot.title = element_text(size = 13, hjust = 0.5))
+print(plot_bouts)
+#ggsave("/Users/yjkang/Desktop/bout_num.pdf", plot = plot_bouts)
+```
+
+==========================
+Change in Energy Budget
+==========================
+Metabolic Equivalent of Task (MET) values commonly used in avian energetics. 1 MET is equivalent to the Basal Metabolic Rate (BMR)—the amount of energy an animal expends while completely at rest, in a post-absorptive (fasting) state, and within its thermoneutral zone (not actively burning calories to stay warm or cool down). 
+
+For large wading birds like cranes, established literature values are approximately:
+Roosting (Resting/Thermoregulating): $1.2 \text{ METs}$
+Foraging (Walking, probing, high vigilance): $3.0 \text{ METs}$
+Traveling (Flapping flight): $12.0 \text{ METs}$
+```{r}
+mass_kg <- 5.6
+mass_g <- mass_kg * 1000
+
+# McKechnie & Wolf (2004) non-passerine Birds allometric equation
+log_BMR_W <- -1.461 + 0.669 * log10(mass_g)
+BMR_W <- 10^log_BMR_W
+BMR_kJ_min <- (BMR_W * 60) / 1000  # Convert Watts to kJ/min
+cat(sprintf("BMR for %.1f kg Crane: %.4f kJ/min\n\n", mass_kg, BMR_kJ_min))
+
+met_values <- c("Traveling" = 12.0, "Foraging" = 3.0, "Roosting" = 1.2)
+energy_df <- grand_bout_summary %>%
+  mutate(
+    METs = met_values[Behavior],
+    Total_Minutes = Robust_Mean_Duration * Robust_Mean_Total_Bouts,
+    MET_mins = Total_Minutes * METs,
+    Total_kJ = MET_mins * BMR_kJ_min 
+    )
+
+#takeoff_penalty_MET_mins <- 15
+#takeoff_cost_kJ <- takeoff_penalty_MET_mins * BMR_kJ_min
+
+summary_totals <- energy_df %>%
+  group_by(Period) %>%
+  summarise(
+    Base_Energy_kJ = sum(Total_kJ),
+    Total_Bouts = sum(Robust_Mean_Total_Bouts),
+    Total_Foraging_Mins = sum(Total_Minutes[Behavior == "Foraging"]),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    #Takeoff_Penalty_kJ = Total_Bouts * takeoff_cost_kJ,
+    Grand_Total_kJ = Base_Energy_kJ #+ Takeoff_Penalty_kJ
+  )
+summary_totals
+```
+
+```{r}
+# Print the specific energy budgets per period
+for(i in 1:nrow(summary_totals)) {
+  p_name <- summary_totals$Period[i]
+  cat(sprintf("=== %s ===\n", p_name))
+  cat(sprintf("Total Energy Expenditure: %.2f kJ/winter\n", summary_totals$Grand_Total_kJ[i]))
+  cat(sprintf("Total Foraging (Intake Window): %.1f minutes\n\n", summary_totals$Total_Foraging_Mins[i]))
+}
+
+# Calculate the critical deficits
+hist_row <- summary_totals %>% filter(str_detect(Period, "Historical"))
+fut_row <- summary_totals %>% filter(str_detect(Period, "Future"))
+if(nrow(hist_row) == 1 && nrow(fut_row) == 1) {
+  cat("=== ECOLOGICAL FITNESS IMPACT ===\n")
+  energy_diff <- (fut_row$Grand_Total_kJ - hist_row$Grand_Total_kJ) / hist_row$Grand_Total_kJ * 100
+  forage_diff <- (fut_row$Total_Foraging_Mins - hist_row$Total_Foraging_Mins) / hist_row$Total_Foraging_Mins * 100
+  cat(sprintf("Change in Net Energy Expenditure: %+.1f%%\n", energy_diff))
+  cat(sprintf("Change in Caloric Intake:  %+.1f%%\n", forage_diff))
+}
+```
+
+
+

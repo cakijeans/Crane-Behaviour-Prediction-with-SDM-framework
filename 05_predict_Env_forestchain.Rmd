@@ -1,0 +1,534 @@
+---
+title: "BigData_Wetland_migratoryBirds"
+author: "Youn Jae Kang"
+date: "2026-04-14"
+output: html_document
+---
+
+What factor of a wetland affects migratory birds? and if the factor changes in the future, how will behaviour change?
+
+```{r load package, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ranger)
+library(tidyverse)
+library(lubridate)
+library(zoo)
+```
+
+```{r}
+crane_data <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/GPScrane_covariates.csv")
+
+train_df <- crane_data %>%
+  # Convert 'time' to a proper datetime object just in case we need it for seasonality later. Date_Time
+  mutate(time = ymd_hms(time)) %>%
+  arrange(Station, time) %>% 
+  group_by(Station) %>%
+  select(
+    time, Station,
+    Temperature.C., Wind_Speed.m.s., SPI6_Smooth,
+    Water_Temp_Smooth, BOD_Smooth, DTN_Smooth, Chlorophyll_Smooth
+  ) %>%
+  drop_na() #%>%
+
+meteo_vars <- c("Temperature.C.", "Wind_Speed.m.s.", "SPI6_Smooth", "Station")
+```
+
+=========================================
+Random Forest pipeline for 2031–2050 data
+=========================================
+Meteo -> Water_Temp -> BOD & DTN -> Chlorophyll
+
+Step 1: The Physical Base
+Input: Meteorological variables (Air Temp, Wind Speed, SPI6).
+Target: Predict Water Temperature.
+
+Step 2: The Chemical State
+Input: Meteorological variables + Predicted Water Temperature.
+Target: Predict DTN and BOD (as nutrient cycling and oxygen demand are highly dependent on water temperature).
+
+Step 3: The Biological Response with Lag (The "Chain Memory" Method)
+Input: Meteorological variables + Predicted Water Temp + Predicted DTN + Predicted BOD.
+Target: Predict Chlorophyll.
+
+```{r}
+set.seed(100)
+print("Training Model 1: Water Temperature...")
+# Water_Temp_Smooth ~ Temperature.C. + Wind_Speed.m.s. + SPI6_Smooth + Station
+form_wtemp <- as.formula(paste("Water_Temp_Smooth ~", paste(meteo_vars, collapse = " + ")))
+rf_wtemp <- ranger(formula = form_wtemp, data = train_df, importance = 'permutation')
+train_df$Pred_Water_Temp <- rf_wtemp$predictions
+
+print("Training Model 2 & 3: BOD and DTN...")
+# BOD/DTN_Smooth ~ Temperature.C. + Wind_Speed.m.s. + SPI6_Smooth + Station + Pred_Water_Temp
+form_chem <- as.formula(paste(" ~", paste(c(meteo_vars, "Pred_Water_Temp"), collapse = " + ")))
+rf_bod <- ranger(formula = update(BOD_Smooth ~ ., form_chem), data = train_df)
+rf_dtn <- ranger(formula = update(DTN_Smooth ~ ., form_chem), data = train_df)
+train_df$Pred_BOD <- rf_bod$predictions
+train_df$Pred_DTN <- rf_dtn$predictions
+```
+
+```{r}
+print("Training Model 4: Chlorophyll-a...")
+# Chlorophyll_Smooth ~ Temperature.C. + Wind_Speed.m.s. + SPI6_Smooth + Station + Mem_Pred_WTemp + Mem_Pred_BOD + Mem_Pred_DTN
+
+train_df <- train_df %>%
+  arrange(Station, time) %>%
+  group_by(Station) %>%
+  mutate(
+    # 3-day rolling averages of the chemical outputs, k=72 steps (36 hours), "right"=look at past.
+    Mem_Pred_WTemp = rollmean(Pred_Water_Temp, k = 72, fill = NA, align = "right"), 
+    Mem_Pred_BOD = rollmean(Pred_BOD, k = 72, fill = NA, align = "right"),
+    Mem_Pred_DTN = rollmean(Pred_DTN, k = 72, fill = NA, align = "right")
+  ) %>%
+  ungroup() %>%
+  drop_na(Mem_Pred_WTemp) # Drop the first 72 hours of the dataset where the rolling average couldn't compute
+
+set.seed(100)
+form_bio <- as.formula(paste("Chlorophyll_Smooth ~", 
+                             paste(c(meteo_vars, "Mem_Pred_WTemp", "Mem_Pred_BOD", "Mem_Pred_DTN"), 
+                                   collapse = " + ")))
+rf_chl <- ranger(formula = form_bio, data = train_df, importance = 'permutation')
+train_df$Pred_Chlorophyll <- rf_chl$predictions
+```
+
+```{r, fig.width=5.2, fig.height=4.5}
+library(patchwork)
+# ---------------------------------------------------------
+# Plot A: Variable Importance (What drives the algal blooms?)
+# ---------------------------------------------------------
+imp_data <- tibble(
+  Variable = names(rf_chl$variable.importance),
+  Importance = rf_chl$variable.importance
+) %>%
+  arrange(Importance) %>%
+  mutate(Variable = factor(Variable, levels = Variable)) 
+plot_imp <- ggplot(imp_data, aes(x = Importance, y = Variable)) +
+  geom_col(fill = "steelblue") +
+  theme_bw() +
+  labs(title = "Drivers of Chlorophyll",
+       x = "Importance (% increase MSE)", y = NULL) +
+  theme(plot.title = element_text(size = 10, hjust=0.5), axis.title = element_text(size = 9) )
+
+# ---------------------------------------------------------
+# Plot B: Predicted vs. Actual Scatter (How accurate is it?)
+# ---------------------------------------------------------
+plot_scatter <- ggplot(train_df, aes(x = Chlorophyll_Smooth, y = Pred_Chlorophyll)) +
+  geom_point(alpha = 0.1, color = "steelblue") +
+  #geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", linewidth = 1) +
+  theme_bw() +
+  labs(title = "Model Accuracy",
+       x = "Observed Chlorophyll",
+       y = "Predicted Chlorophyll") +
+  theme(plot.title = element_text(size = 10, hjust=0.5), axis.title = element_text(size = 9) )
+
+# ---------------------------------------------------------
+# Plot C: Time-Series Fit (Does it catch the seasonal peaks?)
+# ---------------------------------------------------------
+# Let's zoom in on just one year (e.g., 2021) for Station 'Paju' to see the temporal match
+plot_time <- train_df %>%
+  filter(year(time) == 2021, Station == "Paju") %>%
+  ggplot(aes(x = time)) +
+  # Changed 'size' to 'linewidth' to fix the warning
+  geom_line(aes(y = Chlorophyll_Smooth, color = "Actual"), alpha = 0.8, linewidth = 0.8) +
+  geom_line(aes(y = Pred_Chlorophyll, color = "Predicted"), alpha = 0.8, linewidth = 0.5) +
+  theme_bw() +
+  scale_color_manual(values = c("Actual" = "black", "Predicted" = "dodgerblue")) +
+  labs(title = "Seasonal fit (Paju, 2021): trained vs. test",
+       x = "Date", y = "Chlorophyll", color = "Legend") +
+  theme(legend.position = c(0.15, 0.25), legend.title=element_blank(), legend.text = element_text(size = 8),
+        plot.title = element_text(size = 10, hjust=0.5), axis.title = element_text(size = 9) )
+
+final_plot <- (plot_imp | plot_scatter) / plot_time
+print(final_plot)
+#ggsave("/Users/yjkang/Desktop/RF_Training_Results.pdf", final_plot, width = 5.2, height = 4.5)
+```
+
+==============================
+   SSP Future Projections
+==============================
+
+```{r}
+library(ncdf4)
+
+nc_path <- "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/Wetland_2006_2023/Korea_2000_2019_yearly_climate/평균기온_MKPRISMv21_skorea_TA_gridraw_yearly_2000_2019.nc"
+nc_raw <- nc_open(nc_path)
+
+lon_array <- as.numeric(ncvar_get(nc_raw, "longitude"))
+lat_array <- as.numeric(ncvar_get(nc_raw, "latitude"))
+nc_close(nc_raw) #1D axes (601X751)
+grid_coords <- expand.grid(lon = lon_array, lat = lat_array)
+print(paste("Total grid cells reconstructed:", nrow(grid_coords)))
+
+targets <- data.frame(
+  Station = c("Paju", "Cheorwon"),
+  lon = c(126.79618, 127.3113),
+  lat = c(37.76469, 38.1485) )
+
+find_closest_grid <- function(t_lon, t_lat, grid_df) {
+  # Calculate Euclidean distance (straight line)
+  dists <- sqrt((grid_df$lon - t_lon)^2 + (grid_df$lat - t_lat)^2)
+  # Return the exact ROW number (which corresponds to the .txt COLUMN index)
+  return(which.min(dists))
+}
+paju_idx <- find_closest_grid(targets$lon[1], targets$lat[1], grid_coords)
+cheorwon_idx <- find_closest_grid(targets$lon[2], targets$lat[2], grid_coords)
+
+print(paste("Paju Index:", paju_idx))
+print(paste("Cheorwon Index:", cheorwon_idx))
+print(paste("Paju Grid Center is at: Lon", grid_coords$lon[paju_idx], "Lat", grid_coords$lat[paju_idx]))
+print(paste("Cheorwon Grid Center is at: Lon", grid_coords$lon[cheorwon_idx], "Lat", grid_coords$lat[cheorwon_idx]))
+```
+
+```{r}
+library(data.table)
+extracted_list <- list()
+ssp_folder <- "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/realistic/windspeed_SSP245_2031_2050_asc"
+  #windspeed_SSP245_2031_2050_asc #temperature_SSP245_2031_2050_asc
+
+# Loop through the years you want to extract (e.g., 2031 to 2050)
+for (yr in 2031:2050) {
+  file_path <- file.path(ssp_folder, paste0("AR6_SSP245_5ENSMN_skorea_WS_gridraw_daily_", yr, ".txt")) 
+  #"AR6_SSP245_5ENSMN_skorea_WS_gridraw_daily_"  #"AR6_SSP245_5ENSMN_skorea_TA_gridraw_daily_"
+  if(file.exists(file_path)) {
+    print(paste("Extracting year:", yr))
+    # fread opens the 1GB file, grabs ONLY the two numeric columns, and closes it.
+    # header = FALSE ensures the first row of data isn't accidentally deleted/used as names.
+    temp_data <- fread(file_path, select = c(paju_idx, cheorwon_idx), header = FALSE)
+    names(temp_data) <- c("Paju", "Cheorwon")
+    dates <- seq(from = ymd(paste0(yr, "-01-01")), 
+                 to = ymd(paste0(yr, "-12-31")), 
+                 by = "day")
+    # If it's a leap year (366 dates) but the climate model only outputs 365 days...
+    if (length(dates) == 366 && nrow(temp_data) == 365) {
+      # Remove February 29th from our generated R timeline!
+      dates <- dates[!(month(dates) == 2 & day(dates) == 29)]
+    }
+    temp_data$Date <- dates
+    extracted_list[[as.character(yr)]] <- temp_data
+  } else {
+    print(paste("Warning: File not found for year", yr))
+  }
+}
+all_years_df <- bind_rows(extracted_list)
+print(head(all_years_df))
+```
+
+#SPI6 file had different format.
+```{r}
+ssp_folder <- "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP"
+spi6_file_path <- file.path(ssp_folder, "SPI6_SSP245_monthly_2021_2100.txt")
+
+if(file.exists(spi6_file_path)) {
+  spi6_data <- fread(spi6_file_path, select = c(paju_idx, cheorwon_idx), header = FALSE)
+  names(spi6_data) <- c("Paju", "Cheorwon")
+  # Generate timeline anchored to the 1st of the month
+  monthly_dates <- seq(from = ymd("2021-01-01"), 
+                       to = ymd("2100-12-01"), 
+                       by = "month") # 80 years * 12 months = 960 rows expected.
+  # Safety check: Ensure the file length matches our calendar
+  if(nrow(spi6_data) == length(monthly_dates)) {
+    spi6_data$Date <- monthly_dates
+  } else {
+    print(paste("Warning: Mismatch! File has", nrow(spi6_data), "rows, but calendar has", length(monthly_dates)))
+    # Fallback just in case the file is short
+    spi6_data$Date <- monthly_dates[1:nrow(spi6_data)] 
+  }
+  # Slice out exactly the 2031-2050 window you need for your model
+  extracted_spi6 <- spi6_data %>%
+    filter(year(Date) >= 2031 & year(Date) <= 2050)
+} else {
+  print("Error: Could not find the SPI6 file. Please check the file name!")
+}
+
+all_years_df <- bind_rows(extracted_spi6)
+print(head(all_years_df))
+```
+
+```{r}
+# PIVOT TO OUR 'LONG' REGRESSOR FORMAT
+extracted_ssp <- all_years_df %>%
+  pivot_longer(
+    cols = c("Paju", "Cheorwon"),
+    names_to = "Station",
+    values_to = "SPI6_Monthly"  #Temp_Daily, SPI6_Monthly, Wind_Daily
+  ) %>%
+  mutate(
+    # Set the time to Noon (12:00:00) for clean spline interpolation later
+    Date_Time = ymd_hms(paste(Date, "12:00:00"))
+  ) %>%
+  select(Station, Date_Time, SPI6_Monthly) %>%   #Temp_Daily, SPI6_Monthly, Wind_Daily
+  arrange(Station, Date_Time)
+
+print(head(extracted_ssp))
+#temp_ssp <- extracted_ssp
+#wind_ssp <- extracted_ssp
+spi6_ssp <- extracted_ssp
+```
+
+```{r}
+# INTERPOLATE every 30 minute
+library(zoo)
+#merged_ssp <- temp_ssp %>%
+#  left_join(wind_ssp, by = c("Station", "Date_Time")) %>%
+#  left_join(spi6_ssp, by = c("Station", "Date_Time"))
+#write_csv(merged_ssp, "/Users/yjkang/Desktop/SSP_2031_2050_temp_wind_SPI6.csv")
+merged_ssp <-read_csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/realistic/SSP245_2031_2050_temp_wind_SPI6.csv")
+  
+# Create a master hourly grid for 2031-2050
+hourly_grid <- expand_grid(
+  Station = c("Paju", "Cheorwon"),
+  Date_Time = seq(
+    from = ymd_hms("2031-01-01 00:00:00"), 
+    to = ymd_hms("2050-12-31 23:00:00"), 
+    by = "30 min" #hour
+  )
+)
+future_ssp_df <- hourly_grid %>%
+  # Join our daily/monthly data onto the hourly timeline (this creates lots of NAs)
+  left_join(merged_ssp, by = c("Station", "Date_Time")) %>%
+  arrange(Station, Date_Time) %>%
+  group_by(Station) %>%
+  # Fill the NAs by drawing a smooth mathematical curve through the daily noon points!
+  mutate(
+    Temperature.C. = na.spline(Temp_Daily, na.rm = FALSE),
+    Wind_Speed.m.s. = na.spline(Wind_Daily, na.rm = FALSE),
+    SPI6_Smooth = na.spline(SPI6_Monthly, na.rm = FALSE)
+  ) %>%
+  ungroup()
+head(future_ssp_df)
+```
+
+```{r, fig.width=6.5, fig.height=3.5}
+smooth_long <- future_ssp_df %>%
+  select(-Temp_Daily, -Wind_Daily, -SPI6_Monthly) %>%
+  pivot_longer(
+    cols = c(Temperature.C., Wind_Speed.m.s., SPI6_Smooth),
+    names_to = "Variable",
+    values_to = "Smooth_Value")
+anchors_long <- future_ssp_df %>%
+  select(-Temperature.C., -Wind_Speed.m.s., -SPI6_Smooth) %>%
+  pivot_longer(
+    cols = c(Temp_Daily,Wind_Daily,SPI6_Monthly), 
+    names_to = "Variable", 
+    values_to = "Original_Value") %>%
+  mutate(Variable = case_when(
+    Variable == "Temp_Daily" ~ "Temperature.C.",
+    Variable == "Wind_Daily" ~ "Wind_Speed.m.s.",
+    Variable == "SPI6_Monthly" ~ "SPI6_Smooth"
+  )) %>%
+  drop_na(Original_Value)
+
+p_all <- ggplot() +
+  geom_line(data = smooth_long, 
+            aes(x = Date_Time, y = Smooth_Value), 
+            color = "dodgerblue", linewidth = 0.6, alpha=0.6) +
+  geom_point(data = anchors_long, 
+             aes(x = Date_Time, y = Original_Value), 
+             color = "black", shape=16, size = 0.5) +
+  facet_grid(Variable ~ Station, scales = "free_y") +
+  theme_bw() +
+  labs(title = "Blue line = interpolated hourly splines | Black dots = original records",
+       x = "Time", y="") +
+  theme(plot.title = element_text(size = 11, hjust = 0.5),
+        strip.text = element_text(face = "bold", size = 10),
+        strip.background = element_rect(fill = "gray90"))
+print(p_all)
+```
+
+```{r}
+future_df <- future_ssp_df %>%
+  arrange(Station, Date_Time) %>% 
+  filter(month(Date_Time) %in% c(10, 11, 12, 1, 2, 3, 4))
+head(future_df)
+```
+
+```{r}
+set.seed(100)
+# ==========================================
+# RUNNING THE REGRESSOR CHAIN
+# ==========================================
+print("Projecting future Water Temperature...")
+future_df$Pred_Water_Temp <- predict(rf_wtemp, data = future_df)$predictions
+
+print("Projecting future BOD and DTN...")
+future_df$Pred_BOD <- predict(rf_bod, data = future_df)$predictions
+future_df$Pred_DTN <- predict(rf_dtn, data = future_df)$predictions
+
+# ==========================================
+# APPLYING BIOLOGICAL LAG TO FUTURE
+# ==========================================
+print("Applying 36-hour biological lag to future chemical predictions...")
+future_df <- future_df %>%
+  arrange(Station, Date_Time) %>%
+  group_by(Station) %>%
+  mutate(
+    Mem_Pred_WTemp = rollmean(Pred_Water_Temp, k = 72, fill = NA, align = "right"),
+    Mem_Pred_BOD = rollmean(Pred_BOD, k = 72, fill = NA, align = "right"),
+    Mem_Pred_DTN = rollmean(Pred_DTN, k = 72, fill = NA, align = "right")
+  ) %>%
+  ungroup() %>%
+  drop_na(Mem_Pred_WTemp)
+
+# ==========================================
+# FINAL BIOLOGICAL PROJECTION
+# ==========================================
+print("Projecting future Chlorophyll-a...")
+future_df$Pred_Chlorophyll <- predict(rf_chl, data = future_df)$predictions
+
+#select the winter seasons only, since the model was strictly limited to winters.
+future_df <- future_df %>%
+  filter(month(Date_Time) %in% c(10, 11, 12, 1, 2, 3, 4))
+#write_csv(future_df, "/Users/yjkang/Desktop/future_env_2031_2050_30min.csv")
+```
+
+```{r}
+# HISTORICAL DATA (2016 - 2024)
+crane_data <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/GPScrane_covariates.csv")
+hist_df <- crane_data %>% 
+  mutate(
+    Time = ymd_hms(time, truncated = 3),
+    Dataset = "Historical" ) %>%
+  select(
+    Station, Time, Dataset,
+    Temp = Temperature.C., 
+    Wind = Wind_Speed.m.s., 
+    SPI6 = SPI6_Smooth,
+    wTemp = Water_Temp_Smooth,
+    BOD = BOD_Smooth,
+    DTN = DTN_Smooth,
+    Chlor = Chlorophyll_Smooth) %>%
+  drop_na(Time)
+
+#PROJECTED DATA (2031 - 2050)
+future_df <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/realistic/future_env_2031_2050_1hr.csv")
+fut_df <- future_df %>% 
+  mutate(
+    Time = ymd_hms(Date_Time, truncated = 3),
+    Dataset = "Projected") %>%
+  select(
+    Station, Time, Dataset,
+    Temp = Temperature.C., 
+    Wind = Wind_Speed.m.s., 
+    SPI6 = SPI6_Smooth,
+    wTemp = Pred_Water_Temp,
+    BOD = Pred_BOD,
+    DTN = Pred_DTN,
+    Chlor = Pred_Chlorophyll) %>%
+  drop_na(Time)
+
+combined_df <- bind_rows(hist_df, fut_df) %>%
+  pivot_longer(
+    cols = c(Temp, Wind, SPI6, wTemp, BOD, DTN, Chlor),
+    names_to = "Variable",
+    values_to = "Value")
+# Lock the variable order so Water Temp is on top, and Chlorophyll is on the bottom!
+combined_df$Variable <- factor(combined_df$Variable, 
+                               levels = c("Temp", "Wind", "SPI6","wTemp", "BOD", "DTN", "Chlor"))
+```
+
+```{r, fig.width=9.5, fig.height=8}
+p_final <- ggplot(combined_df, aes(x = Time, y = Value, color = Dataset)) +
+  geom_point(alpha = 0.8, size = 0.2, shape=16) +
+  facet_grid(Variable ~ Station, scales = "free_y") +
+  scale_color_manual(values = c("Historical" = "black", "Projected" = "steelblue")) +
+  theme_bw() +
+  labs(title = "Historical vs. Projected Winter Environment",
+    subtitle = "SSP2-4.5 Scenario (2031-2050)", x = "Year", y = "") +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+    strip.text = element_text(face = "bold", size = 11),
+    strip.background = element_rect(fill = "gray90"),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11)
+  )
+print(p_final)
+#ggsave("/Users/yjkang/Desktop/env_predict.pdf", plot=p_final, height=8, width=9.5)
+```
+
+==============================
+Historical vs. Future Env Shift
+==============================
+```{r}
+future_env <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/realistic/future_env_2031_2050_1hr.csv")
+future_env <- future_env %>%
+  mutate(
+    Date_Time = ymd_hms(Date_Time, tz = "UTC"),
+    Month_Date = format(Date_Time, "%m-%d %H:%M"),
+    Fut_Temp   = Temperature.C.,    
+    Fut_Wind   = Wind_Speed.m.s.,
+    Fut_SPI6   = SPI6_Smooth, 
+    Fut_wTemp  = Pred_Water_Temp,   
+    Fut_BOD    = Pred_BOD,
+    Fut_DTN    = Pred_DTN, 
+    Fut_Chlor  = Pred_Chlorophyll ) %>%
+  filter(month(Date_Time) %in% c(10, 11, 12, 1, 2, 3, 4)) %>%
+  select(Station, Month_Date, Fut_Temp, Fut_Wind, Fut_wTemp, Fut_BOD, Fut_Chlor, Fut_DTN, Fut_SPI6) %>%
+  na.omit()
+
+hist_env <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/global_hmm_data.csv")
+hist_env <- hist_env %>%
+  mutate(roundT = ymd_hms(roundT, tz = "UTC"),
+         Month_Date = format(roundT, "%m-%d %H:%M") ) %>%
+  filter(In_Hangang == 1) %>%
+  select(Station, Month_Date, Temp, Wind, wTemp, BOD, Chlor, DTN, SPI6)
+
+comb_env <- hist_env %>%
+  left_join(future_env, by = c("Station", "Month_Date"), relationship = "many-to-many") %>%
+  drop_na() %>% 
+  as.data.frame()
+```
+
+```{r, fig.width=8, fig.height=4}
+hist_df <- comb_env %>%
+  select(Station, Month_Date, Temp, Wind, wTemp, BOD, Chlor, DTN, SPI6) %>%
+  distinct() %>%
+  pivot_longer(cols = c(Temp, Wind, wTemp, BOD, Chlor, DTN, SPI6), names_to = "Variable",values_to = "Value") %>%
+  mutate(Period = "Historical",nVariable = str_replace(Variable, "Han_", ""))
+fut_df <- comb_env %>%
+  select(Station, Month_Date, starts_with("Fut_")) %>%
+  pivot_longer(cols = starts_with("Fut_"),names_to = "Variable",values_to = "Value") %>%
+  mutate(Period = "Future",Variable = str_replace(Variable, "Fut_", ""))
+combined_df <- bind_rows(hist_df, fut_df) %>% filter(!is.na(Value)) %>%
+  mutate(Variable = factor(Variable, levels = c("Temp", "Wind", "SPI6", "wTemp", "BOD", "DTN", "Chlor")), 
+         Period = factor(Period, levels = c("Historical", "Future")) )
+mu_df <- combined_df %>%
+  group_by(Variable, Period) %>%
+  summarise(grp_mean = mean(Value, na.rm = TRUE), .groups = 'drop')
+
+distribution_plot <- ggplot(combined_df, aes(x = Value, fill = Period)) +
+  geom_density(alpha = 0.5, color = "black", linewidth = 0.5) +
+  geom_vline(data = mu_df, aes(xintercept = grp_mean, color = Period, linetype=Period), linewidth = 0.5, show.legend = FALSE) +
+  facet_wrap(~Variable, scales = "free") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Historical" = "grey", "Future" = "dodgerblue3"),
+                    labels = c("Historical" = "Historical (2016-2024)", "Future" = "Future (2031-2050)"), name = NULL) +
+  scale_color_manual(values = c("Historical" = "grey20", "Future" = "dodgerblue4"), labels =NULL, name = NULL) +
+  labs(y = "Probability Density",fill = "") +
+  theme(legend.position = c(0.48, 0.08), panel.spacing.y = unit(20, "pt"),
+        strip.text = element_text(face = "bold", size = 10) )
+print(distribution_plot)
+ggsave("/Users/yjkang/Desktop/env_shift.pdf", plot=distribution_plot, height=4, width=8)
+```
+
+```{r}
+library(effectsize)
+
+effect_size_results <- combined_df %>%
+  filter(!is.na(Value)) %>%
+  group_by(Variable) %>%
+  filter(n_distinct(Period) == 2) %>%
+  do(as.data.frame(rank_biserial(Value ~ Period, data = .)))
+
+print(effect_size_results)
+```
+Effect sizes evaluated based on their absolute values ($|r_{rb}|$) using the following standard thresholds:
+$|r_{rb}| < 0.10$: Negligible effect
+$0.10 \le |r_{rb}| < 0.30$: Small effect
+$0.30 \le |r_{rb}| < 0.50$: Moderate effect
+$|r_{rb}| \ge 0.50$: Large effect
+
+
+
