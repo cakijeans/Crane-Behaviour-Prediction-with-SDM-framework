@@ -1,0 +1,661 @@
+---
+title: "Multiple imputation of the crawled track: does interpolated pseudo-data drive the Hangang HMM?"
+author: "Youn Jae Kang"
+date: "2026-10-21"
+output: html_document
+---
+
+The main pipeline (03 → 04 → 06) fits the HMMs to a regularised track: the crawl posterior mean.
+Here `n_sims` draws equally plausible versions of that track, and the results are combined with Rubin's rules. 
+(Multiple Imputation; McClintock 2017,McClintock & Michelot 2018).
+
+```{r packages, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(lubridate)
+library(momentuHMM)
+library(argosfilter)
+library(MASS, exclude = "select")
+library(parallel)
+library(suncalc)
+```
+
+# Settings
+```{r settings}
+paths <- list(
+  gps_raw      = "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/GrusVipio_GPS.csv",
+  wscc_clean   = "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/birdGPStrajectory/cleaned_White_naped_crane_Mongolia_WSCC.csv",
+  hmm_ready    = "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/HMM_Ready_Crane_combined_UTC.csv",  # 04's input track
+  ref_model    = "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/04_Hangang_Crane_dynHMM/Dyn_Crane_HMM_UTC.rds",
+  scaling_ref  = "/Users/yjkang/Desktop/NIE_BigData/HMM_scaling_ref.rds",
+  out_dir      = "/Users/yjkang/Desktop/mi_sensitivity"
+)
+dir.create(paths$out_dir, showWarnings = FALSE, recursive = TRUE)
+
+n_sims       <- 20     
+impute_tags  <- c("<=1 h", "2 h", "4 h")
+n_cores      <- 4     
+n_draws      <- 200        # parameter draws per imputation
+fut_years    <- 2031:2070  # future period: every historical crane-hour is replayed in each of these years
+nlm_par      <- list()
+gv_clock_tz    <- "Asia/Seoul"  # clock GrusVipio_GPS.csv is written in (as 03); converted to UTC on reading.
+seg_margin_h   <- 2     # buffer
+gap_threshold_min <- 24 * 60
+min_points        <- 10
+hdop_max          <- 5
+vmax_ms           <- 80 * 1000 / 3600
+base_ids          <- c("27233947", "br22063", "br22064", "br23011", "br23018")
+match_tol_m       <- 1  # largest step difference accepted (m)
+bb_window      <- 7     # residuals per window, taken within one run only
+bb_gps_error_m <- 15    # GPS location error (m) in the motion-variance estimate
+bb_twilight_deg <- -6   # day/night
+bb_break_km    <- 30    # a move between consecutive fixes
+bb_long_gap_h  <- 6     # gaps for sigma^2 from the gap's own displacement
+
+set.seed(2026)
+cached <- function(name, expr) {
+  f <- file.path(paths$out_dir, paste0(name, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  val <- expr
+  saveRDS(val, f)
+  val
+}
+base_id <- function(id) sub("_[0-9]+$", "", id)
+as_hmm  <- function(d) { class(d) <- c("momentuHMMData", "data.frame"); d }
+run_tag <- paste0("imp", paste(sort(gsub("[^0-9]", "", impute_tags)), collapse = "-"))
+cat("Run:", run_tag, "\n")
+```
+
+# A. Main model and helpers
+```{r reference}
+prep_for_ci <- function(fit) {
+  fit$data[] <- lapply(fit$data, function(x) if (is.numeric(x)) as.numeric(x) else x)
+  environment(fit$conditions$formula) <- globalenv()
+  fit
+}
+ref_model   <- prep_for_ci(readRDS(paths$ref_model))
+scaling_ref <- readRDS(paths$scaling_ref)
+fixed_step  <- c(t(ref_model$mle$step))    # main base values: means (Travel, Forage, Roost), SDs
+fixed_angle <- c(t(ref_model$mle$angle))   # means, concentrations
+ref_beta    <- ref_model$mle$beta
+
+hmm_dist    <- list(step = "gamma", angle = "vm")
+states      <- c("Travel", "Forage", "Roost")
+dyn_formula <- ~ Han_Temp + Han_Wind + Han_SPI6 + Han_wTemp + Han_BOD + Han_DTN + Han_Chlor
+cov_vars    <- c("Temp", "Wind", "wTemp", "BOD", "Chlor", "DTN", "SPI6")
+han_vars    <- paste0("Han_", cov_vars)
+z_ref <- function(x, var) (x - scaling_ref[[paste0(var, "_mu")]]) / scaling_ref[[paste0(var, "_sd")]]
+stopifnot(identical(colnames(ref_beta), c("1 -> 2", "1 -> 3", "2 -> 1", "2 -> 3", "3 -> 1", "3 -> 2")))
+
+beta_vcov <- function(m) {
+  b <- m$mle$beta; est <- m$mod$estimate; S <- m$mod$Sigma
+  if (is.null(S) && !is.null(m$mod$hessian)) {     
+    free <- setdiff(seq_along(est), m$conditions$optInd)
+    S0   <- tryCatch(ginv(m$mod$hessian), error = function(e) NULL)
+    if (!is.null(S0) && nrow(S0) == length(free)) {
+      S <- matrix(0, length(est), length(est)); S[free, free] <- S0
+    }
+  }
+  if (is.null(S) || inherits(S, "error")) return(NULL)
+  nb  <- length(b)
+  off <- which(vapply(0:(length(est) - nb), function(o)
+    isTRUE(all.equal(est[o + seq_len(nb)], c(b), tolerance = 1e-8)), logical(1))) - 1
+  if (length(off) != 1) return(NULL)
+  V <- S[off + seq_len(nb), off + seq_len(nb)]
+  if (any(!is.finite(V)) || any(diag(V) <= 0)) return(NULL)
+  nm <- paste(rep(colnames(b), each = nrow(b)), rep(rownames(b), ncol(b)), sep = " | ")
+  dimnames(V) <- list(nm, nm)
+  V
+}
+stopifnot(!is.null(beta_vcov(ref_model)))        
+stopifnot(isTRUE(all.equal(sqrt(diag(beta_vcov(ref_model))), c(CIbeta(ref_model)$beta$se),
+                           tolerance = 1e-6, check.attributes = FALSE)))
+```
+
+# B. Real fixes and track segments (as 03)
+```{r observed fixes}
+raw <- read.csv(paths$gps_raw, check.names = FALSE)
+raw$timestamp_clean <- with_tz(as.POSIXct(raw$Datetime, format = "%Y-%m-%d %H:%M:%S", tz = gv_clock_tz), "UTC")
+raw <- subset(raw, !is.na(latitude) & !is.na(longitude) & !is.na(timestamp_clean))
+raw <- subset(raw, GPS_DOP <= hdop_max | is.na(GPS_DOP))
+gv_clean <- do.call(rbind, lapply(split(raw, raw$ID), function(b) {
+  b <- b[order(b$timestamp_clean), ]
+  b <- b[!duplicated(b$timestamp_clean), ]
+  f <- vmask(lat = b$latitude, lon = b$longitude, dtime = b$timestamp_clean, vmax = vmax_ms)
+  b[f %in% c("not", "end_location"), ]
+})) %>% transmute(ID = as.character(ID), time = timestamp_clean, latitude, longitude)
+
+wscc <- read.csv(paths$wscc_clean, check.names = FALSE)
+wscc_clean <- data.frame(
+  ID        = as.character(wscc$`individual-local-identifier`),
+  time      = as.POSIXct(wscc$timestamp_clean, format = "%Y-%m-%d %H:%M:%S", tz = "UTC"),
+  latitude  = wscc$`location-lat`,
+  longitude = wscc$`location-long`)
+
+obs_ll <- bind_rows(gv_clean, wscc_clean) %>%
+  filter(ID %in% base_ids, !is.na(time)) %>%
+  distinct(ID, time, .keep_all = TRUE)
+xy <- st_coordinates(st_transform(st_as_sf(obs_ll, coords = c("longitude", "latitude"), crs = 4326), 32649))
+obs_raw <- data.frame(ID = obs_ll$ID, time = obs_ll$time, x = xy[, "X"], y = xy[, "Y"]) %>% arrange(ID, time)
+
+tag_groups <- obs_raw %>% group_by(Bird = ID) %>%
+  summarise(n_fixes = n(),
+            native_h = median(as.numeric(diff(time), units = "hours")), .groups = "drop") %>%
+  mutate(Tag_group = cut(native_h, c(0, 1.05, 2.1, Inf), labels = c("<=1 h", "2 h", "4 h")))
+print(tag_groups)
+tag_of <- setNames(as.character(tag_groups$Tag_group), tag_groups$Bird)
+
+obs_seg <- obs_raw %>%
+  group_by(ID) %>%
+  mutate(dt = as.numeric(difftime(time, lag(time), units = "mins")),
+         burst = cumsum(!is.na(dt) & dt > gap_threshold_min) + 1,
+         ID = paste0(ID, "_", burst)) %>%
+  ungroup() %>%
+  select(ID, time, x, y) %>%
+  group_by(ID) %>% filter(n() >= min_points) %>% ungroup() %>%
+  as.data.frame()
+```
+
+# C. Tracks and imputations
+```{r main track}
+pub_hg  <- as.data.frame(ref_model$data)
+hmm_ids <- unique(as.character(pub_hg$ID))
+min_key <- function(id, t) paste(as.character(id), round(as.numeric(floor_date(t, "minute"))))
+sec_key <- function(id, t) paste(as.character(id), round(as.numeric(t)))
+pub_key <- min_key(pub_hg$ID, pub_hg$time)
+
+mean_path <- read.csv(paths$hmm_ready, colClasses = c(time = "character")) %>%
+  transmute(ID      = as.character(ID),
+            time_04 = as.POSIXct(time, format = "%Y-%m-%d %H:%M", tz = "UTC"),   # as 04 read it
+            time    = ymd_hms(time, truncated = 3, tz = "UTC", quiet = TRUE),     # exact time
+            x, y) %>%
+  filter(ID %in% hmm_ids, !is.na(time_04)) %>%
+  distinct(ID, time_04, .keep_all = TRUE) %>%                                 # as 04
+  mutate(rmin = minute(round_date(time_04, "30 min"))) %>%
+  filter(rmin == 30 | (ID == "br23018_11" & rmin == 0)) %>%                  # 04's 1-h subsample
+  arrange(ID, time) %>%
+  select(ID, time, x, y) %>%
+  as.data.frame()
+
+# Steps (m) and angles of a track, as prepData() computes them in 04
+track_steps <- function(d) {
+  p <- prepData(d[, c("ID", "time", "x", "y")], type = "UTM", coordNames = c("x", "y"))
+  data.frame(ID = as.character(p$ID), time = p$time, x = p$x, y = p$y, step = p$step, angle = p$angle)
+}
+# Hangang data with the step lengths (km) and turning angles of a track
+hangang_from_track <- function(tr) {
+  m <- match(pub_key, min_key(tr$ID, tr$time))
+  if (anyNA(m)) stop("track lacks ", sum(is.na(m)), " rows of the main data")
+  hg <- pub_hg
+  hg$x <- tr$x[m]; hg$y <- tr$y[m]
+  hg$step  <- tr$step[m] / 1000
+  hg$step[which(hg$step == 0)] <- 1e-4                         # as 04
+  hg$angle <- tr$angle[m]
+  hg$step[is.na(pub_hg$step)]   <- NA                          
+  hg$angle[is.na(pub_hg$angle)] <- NA
+  as_hmm(hg)
+}
+
+# j = 0 reproduce the HMM data
+hg0 <- hangang_from_track(track_steps(mean_path))
+pos_dev  <- max(sqrt((hg0$x - pub_hg$x)^2 + (hg0$y - pub_hg$y)^2))
+step_dev <- 1000 * max(abs(hg0$step - pub_hg$step), na.rm = TRUE)
+stopifnot(pos_dev < 1e-3, step_dev < match_tol_m,
+          !anyNA(hg0$step[!is.na(pub_hg$step)]), !anyNA(hg0$angle[!is.na(pub_hg$angle)]))
+
+# Real fixes of these bursts
+fixes <- obs_seg %>% filter(ID %in% hmm_ids) %>% arrange(ID, time)
+stopifnot("bursts of the main HMM not rebuilt from the raw fixes" = all(hmm_ids %in% fixes$ID))
+```
+
+## dynamic Brownian bridge
+Random movement between fixes comes from the dynamic Brownian bridge movement model (Kranstauber et al. 2012, J. Anim. Ecol.; Horne et al. 2007, Ecology). At every fix, the Brownian motion variance σ² is estimated by maximum likelihood in a sliding window of `bb_window` fixes: each interior fix is left out and predicted by straight-line interpolation between its neighbours, with variance:
+T·α(1−α)·σ² + ((1−α)² + α²)·δ² per axis 
+(T = time between the neighbours, α = fraction of T elapsed at the fix, δ = GPS error `bb_gps_error_m`). 
+
+The track is cut into day/night (sun altitude `bb_twilight_deg`), at moves longer than `bb_break_km` between consecutive fixes (migration) and at gaps longer than `bb_long_gap_h`. σ² is then estimated per gap:
+```{r motion variance}
+fixes_ll  <- st_coordinates(st_transform(st_as_sf(fixes, coords = c("x", "y"), crs = 32649), 4326))
+fixes$day <- getSunlightPosition(data = data.frame(date = fixes$time, lat = fixes_ll[, "Y"],
+                                                   lon = fixes_ll[, "X"]))$altitude > bb_twilight_deg * pi / 180
+
+bb_gap_sigma2 <- function(f) {     # f: fixes of one burst sorted by time -> sigma^2 (m^2/h) and kind of every gap
+  n  <- nrow(f); th <- as.numeric(f$time) / 3600
+  Tg <- diff(th); dg <- sqrt(diff(f$x)^2 + diff(f$y)^2)
+  run <- cumsum(c(TRUE, f$day[-1] != f$day[-n] | dg > bb_break_km * 1000 | Tg > bb_long_gap_h))
+  i  <- 2:(n - 1)                  # residual k is fix i[k] = k + 1 left out
+  T  <- th[i + 1] - th[i - 1]; a <- (th[i] - th[i - 1]) / T
+  r2 <- (f$x[i] - (f$x[i - 1] + a * (f$x[i + 1] - f$x[i - 1])))^2 +
+        (f$y[i] - (f$y[i - 1] + a * (f$y[i + 1] - f$y[i - 1])))^2
+  A  <- T * a * (1 - a); E <- ((1 - a)^2 + a^2) * bb_gps_error_m^2
+  pure <- run[i - 1] == run[i] & run[i + 1] == run[i]
+  ml  <- function(w) {
+    nll <- function(ls2) { v <- A[w] * exp(ls2) + E[w]; sum(log(v) + r2[w] / (2 * v)) }
+    exp(optimize(nll, c(log(1e-2), log(1e10)))$minimum)
+  }
+  inc <- function(g) max((dg[g]^2 / 2 - 2 * bb_gps_error_m^2) / Tg[g], 1e-2)
+  out <- lapply(seq_len(n - 1), function(g) {
+    if (Tg[g] > bb_long_gap_h) return(list(inc(g), "long gap"))
+    if (run[g] == run[g + 1]) {
+      k <- which(pure & run[i] == run[g])
+      if (!length(k)) return(list(inc(g), "run < 3 fixes"))
+      k <- k[order(abs(i[k] - (g + 0.5)))][seq_len(min(bb_window, length(k)))]
+      return(list(ml(k), if (f$day[g]) "day" else "night"))
+    }
+    k <- intersect(c(g - 1, g), seq_along(i))     # residuals at the gap's two end fixes
+    kind <- if (dg[g] > bb_break_km * 1000) "long move" else "twilight"
+    if (!length(k)) return(list(inc(g), kind))
+    list(ml(k), kind)
+  })
+  data.frame(gap = seq_len(n - 1), s2 = vapply(out, `[[`, numeric(1), 1),
+             kind = vapply(out, `[[`, character(1), 2))
+}
+gap_list <- lapply(split(fixes, fixes$ID), function(f) {
+  f <- f[order(f$time), ]
+  data.frame(ID = f$ID[1], start = f$time[-nrow(f)], end = f$time[-1], bb_gap_sigma2(f))
+})
+
+# Between two fixes.
+pert <- bind_rows(lapply(hmm_ids, function(id) {
+  r  <- which(mean_path$ID == id); t <- as.numeric(mean_path$time[r])
+  h  <- sort(as.numeric(pub_hg$time[pub_hg$ID == id]))
+  k  <- findInterval(t, h)
+  near <- pmin(abs(t - h[pmax(k, 1)]), abs(h[pmin(k + 1, length(h))] - t)) <= seg_margin_h * 3600
+  gs <- gap_list[[id]]; o <- as.numeric(gs$start); o <- c(o, as.numeric(gs$end[nrow(gs)]))
+  g  <- findInterval(t, o)
+  ok <- near & g >= 1 & g < length(o) & t > o[pmax(g, 1)]
+  data.frame(row = r[ok], ID = id, gap = g[ok],
+             tau = (t[ok] - o[g[ok]]) / 3600, T = (o[g[ok] + 1] - o[g[ok]]) / 3600,
+             s2  = gs$s2[g[ok]], kind = gs$kind[g[ok]])
+}))
+write.csv(bind_rows(gap_list) %>% transmute(ID, start, end, kind, sigma_m_per_sqrt_h = sqrt(s2)),
+          file.path(paths$out_dir, "mi_bb_gap_sigma.csv"), row.names = FALSE)
+```
+
+## Draw the noise
+Within each gap the noise is a Brownian bridge with that gap's σ², simulated sequentially at the hourly
+rows: zero at both fixes, independent between gaps.
+```{r draw noise}
+draw_bb <- function(p) {
+  n <- nrow(p); bx <- by <- numeric(n); zx <- rnorm(n); zy <- rnorm(n)
+  key <- paste(p$ID, p$gap); prev <- ""; s <- 0; px <- 0; py <- 0
+  for (k in seq_len(n)) {
+    if (key[k] != prev) { prev <- key[k]; s <- 0; px <- 0; py <- 0 }   
+    w  <- (p$T[k] - p$tau[k]) / (p$T[k] - s)                           
+    sd <- sqrt(p$s2[k] * (p$tau[k] - s) * (p$T[k] - p$tau[k]) / (p$T[k] - s))
+    px <- px * w + sd * zx[k]; py <- py * w + sd * zy[k]
+    bx[k] <- px; by[k] <- py; s <- p$tau[k]
+  }
+  data.frame(row = p$row, ID = p$ID, dx = bx, dy = by)
+}
+set.seed(2026)
+noise <- lapply(seq_len(n_sims), function(j) draw_bb(pert))
+
+imputed <- function(id) tag_of[base_id(id)] %in% impute_tags
+
+track_j <- function(j) {
+  d <- mean_path
+  if (j > 0) {
+    nz <- noise[[j]][imputed(noise[[j]]$ID), ]
+    d$x[nz$row] <- d$x[nz$row] + nz$dx
+    d$y[nz$row] <- d$y[nz$row] + nz$dy
+  }
+  track_steps(d)
+}
+tracks  <- lapply(0:n_sims, track_j)
+hg_list <- lapply(tracks, hangang_from_track)
+names(tracks) <- names(hg_list) <- 0:n_sims
+```
+
+## Spread checks
+```{r spread checks}
+X <- sapply(tracks[-1], `[[`, "x"); Y <- sapply(tracks[-1], `[[`, "y")
+tr0 <- tracks[["0"]]
+o_idx <- split(seq_len(nrow(fixes)), fixes$ID)
+pos_diag <- bind_rows(lapply(hmm_ids, function(id) {
+  r <- which(tr0$ID == id)
+  o <- fixes$time[o_idx[[id]]]
+  i <- findInterval(as.numeric(tr0$time[r]), as.numeric(o))
+  lo <- o[pmax(i, 1)]; hi <- o[pmin(i + 1, length(o))]
+  data.frame(ID = id,
+             gap_h = as.numeric(difftime(hi, lo, units = "hours")),
+             used  = min_key(id, tr0$time[r]) %in% pub_key[!is.na(pub_hg$step)],
+             sd_m  = sqrt(apply(X[r, , drop = FALSE], 1, var) + apply(Y[r, , drop = FALSE], 1, var)))
+}))
+gap_class <- function(g) cut(g, c(-Inf, 0.6, 1.1, 2.1, 4.1, 12, Inf),
+                             labels = c("<=30 min", "1 h", "2 h", "4 h", "4-12 h", ">12 h"))
+
+# Position spread across imputations, by the gap the hour falls in (rows the HMM uses)
+print(pos_diag %>% filter(used) %>% mutate(gap = gap_class(gap_h)) %>%
+        group_by(gap) %>%
+        summarise(rows = n(), median_sd_m = median(sd_m), p90_sd_m = quantile(sd_m, 0.9),
+                  max_sd_m = max(sd_m), .groups = "drop") %>%
+        mutate(across(where(is.numeric), ~ signif(., 3))))
+```
+
+# D. Fit the 04 dynamic HMM to every imputation
+```{r fit imputations}
+js <- 0:n_sims
+fit_tasks <- lapply(js, function(j) {
+  f <- file.path(paths$out_dir, sprintf("mi_%s_fit_%02d.rds", run_tag, j))
+  list(j = j, file = f, hg = if (file.exists(f)) NULL else hg_list[[as.character(j)]],
+       fixed_step = fixed_step, fixed_angle = fixed_angle,
+       ref_beta = ref_beta, hmm_dist = hmm_dist, dyn_formula = dyn_formula, nlm_par = nlm_par,
+       prep_for_ci = prep_for_ci)
+})
+
+fit_one <- function(tk) {
+  if (file.exists(tk$file)) return(readRDS(tk$file))
+  res <- if (inherits(tk$hg, "error")) list(ok = FALSE, why = conditionMessage(tk$hg)) else
+    tryCatch({
+      dm <- momentuHMM::fitHMM(data = tk$hg, nbStates = 3, dist = tk$hmm_dist,
+                               Par0 = list(step = tk$fixed_step, angle = tk$fixed_angle),
+                               beta0 = tk$ref_beta, estAngleMean = list(angle = TRUE),
+                               fixPar = list(step = tk$fixed_step, angle = tk$fixed_angle),
+                               formula = tk$dyn_formula, nlmPar = tk$nlm_par)
+      list(ok = TRUE, dyn = tk$prep_for_ci(dm))
+    }, error = function(e) list(ok = FALSE, why = conditionMessage(e)))
+  saveRDS(res, tk$file)
+  res
+}
+
+cl <- makeCluster(n_cores)
+invisible(clusterEvalQ(cl, { library(momentuHMM); NULL }))
+fits <- tryCatch(parLapplyLB(cl, fit_tasks, fit_one), finally = stopCluster(cl))
+names(fits) <- js
+rm(fit_tasks)
+
+fit_tab <- bind_rows(lapply(names(fits), function(j) {
+  f <- fits[[j]]
+  if (inherits(f, "try-error") || !isTRUE(f$ok))
+    return(data.frame(imputation = as.integer(j), valid = FALSE,
+                      note = if (is.list(f)) f$why else as.character(f)))
+  no_cov <- is.null(beta_vcov(f$dyn))
+  data.frame(imputation = as.integer(j),
+             valid = !no_cov,
+             note  = if (no_cov) "no covariance" else "",
+             n_hangang = nrow(f$dyn$data),
+             pct_step_observed = round(100 * mean(!is.na(f$dyn$data$step)), 1),
+             dyn_code = f$dyn$mod$code)
+}))
+#write.csv(fit_tab, file.path(paths$out_dir, paste0("mi_", run_tag, "_fits.csv")), row.names = FALSE)
+
+use <- as.character(fit_tab$imputation[fit_tab$valid & fit_tab$imputation > 0])
+m   <- length(use)
+if (m < 5) stop("Fewer than 5 valid imputations; check fit_tab before pooling.")
+```
+
+# E. Pooled transition betas
+Each beta is pooled across the m imputations with Rubin's rules: total variance T = W + (1 + 1/m) × B
+(W = mean within-imputation variance, B = between-imputation variance), and a 95% interval.
+```{r pool betas}
+rubin <- function(est, v, alpha = 0.05) {
+  m <- length(est); qbar <- mean(est); W <- mean(v); B <- var(est)
+  Tt  <- W + (1 + 1 / m) * B
+  lam <- (1 + 1 / m) * B / Tt
+  df  <- if (lam > 0) (m - 1) / lam^2 else Inf
+  h   <- qt(1 - alpha / 2, df) * sqrt(Tt)
+  c(Est = qbar, SE = sqrt(Tt), Lower = qbar - h, Upper = qbar + h, lambda = lam)
+}
+
+E <- t(sapply(use, function(j) c(fits[[j]]$dyn$mle$beta)))
+V <- t(sapply(use, function(j) diag(beta_vcov(fits[[j]]$dyn))))
+pooled <- as.data.frame(t(sapply(seq_len(ncol(E)), function(k) rubin(E[, k], V[, k]))))
+pooled <- pooled[, c("Est", "SE", "Lower", "Upper")]
+pooled$Covariate  <- rep(rownames(ref_beta), times = ncol(ref_beta))
+pooled$Transition <- rep(colnames(ref_beta), each  = nrow(ref_beta))
+
+ci_ref <- CIbeta(ref_model)$beta
+pub <- data.frame(Covariate  = rep(rownames(ci_ref$est), times = ncol(ci_ref$est)),
+                  Transition = rep(colnames(ci_ref$est), each  = nrow(ci_ref$est)),
+                  Est_pub = c(ci_ref$est), Lower_pub = c(ci_ref$lower), Upper_pub = c(ci_ref$upper))
+
+# j = 0: the main data refitted here; should equal Est_pub (checks the refitting itself)
+pub$Est_meanpath <- if (isTRUE(fits[["0"]]$ok)) c(fits[["0"]]$dyn$mle$beta) else NA_real_
+
+mi_beta <- pub %>%
+  left_join(pooled, by = c("Covariate", "Transition")) %>%
+  mutate(Sig_pub   = Lower_pub > 0 | Upper_pub < 0,
+         Sig_MI    = Lower > 0 | Upper < 0,
+         Status    = case_when(sign(Est) != sign(Est_pub) ~ "FLIP",
+                               Sig_MI ~ "kept", TRUE ~ "n.s."),
+         Transition_name = paste(states[as.integer(substr(Transition, 1, 1))], "->",
+                                 states[as.integer(substr(Transition, 6, 6))])) %>%
+  select(Covariate, Transition, Transition_name, Est_pub, Lower_pub, Upper_pub, Sig_pub,
+         Est_meanpath, Est_MI = Est, SE_MI = SE, Lower_MI = Lower, Upper_MI = Upper, Sig_MI,
+         Status)
+
+cat("\nMean path vs main betas: r =", round(cor(mi_beta$Est_meanpath, mi_beta$Est_pub), 3), "\n")
+
+# The effects reported in the paper (significant in the main model)
+reported <- mi_beta %>% filter(Sig_pub, Covariate != "(Intercept)") %>% arrange(Transition, Covariate)
+print(as_tibble(reported) %>% mutate(across(where(is.numeric), ~ round(., 3))), width = Inf, n = Inf)
+#print(reported %>% mutate(across(where(is.numeric), ~ round(., 3))), width = Inf)
+
+cat("\nReported effects:", nrow(reported),
+    "| kept:", sum(reported$Status == "kept"), "| n.s.:", sum(reported$Status == "n.s."),
+    "| flipped:", sum(reported$Status == "FLIP"), "\n")
+cat("Intercepts (baseline switching):\n")
+print(mi_beta %>% filter(Covariate == "(Intercept)") %>%
+        select(Transition_name, Est_pub, Lower_pub, Upper_pub, Est_MI, Lower_MI, Upper_MI))
+
+#write.csv(mi_beta, file.path(paths$out_dir, paste0("mi_", run_tag, "_betas.csv")), row.names = FALSE)
+```
+
+```{r beta plots, fig.width=8, fig.height=7}
+forest_df <- bind_rows(
+  mi_beta %>% transmute(Covariate, Transition_name, Model = "main", Est = Est_pub,
+                        Lower = Lower_pub, Upper = Upper_pub),
+  mi_beta %>% transmute(Covariate, Transition_name, Model = "Pooled MI", Est = Est_MI,
+                        Lower = Lower_MI, Upper = Upper_MI)) %>%
+  filter(Covariate != "(Intercept)")
+p_forest <- ggplot(forest_df, aes(Est, Covariate, colour = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray50") +
+  geom_pointrange(aes(xmin = Lower, xmax = Upper), position = position_dodge(width = 0.6), size = 0.15) +
+  facet_wrap(~ Transition_name, ncol = 3) +
+  scale_colour_manual(values = c(main = "black", `Pooled MI` = "#0072B2")) +
+  theme_bw(base_size = 9) +
+  labs(x = "Beta (logit scale)", y = "", colour = "",
+       title = "Transition betas: main single track vs pooled multiple imputation") +
+  theme(legend.position = "bottom")
+print(p_forest)
+#ggsave("/Users/yjkang/Desktop/MI_beta.pdf", plot = p_forest, width = 8, height = 7)
+```
+
+# F. Pooled bout simulation (06) over 2031–2070
+The 06 bout simulation, repeated for every imputation.
+```{r bout helpers}
+behav        <- c("Traveling", "Foraging", "Roosting")          # states 1-3
+metric_types <- c("Bouts per day", "Mean bout (h)", "Mean gap between (h)")
+metric_names <- c(paste("Bouts per day |", behav), paste("Mean bout (h) |", behav),
+                  paste("Mean gap between (h) |", behav))
+ssp_dir   <- "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/supp05_predict_env"
+ssp_files <- c(`SSP1-2.6` = "future_env_2031_2070_30min_rawSSP126.csv",
+               `SSP2-4.5` = "future_env_2031_2070_30min_rawSSP.csv",
+               `SSP5-8.5` = "future_env_2031_2070_30min_rawSSP585.csv")
+scenarios      <- names(ssp_files)
+periods        <- c("Historical", scenarios)
+min_hist_steps <- 200
+fut_winters    <- min(fut_years):(max(fut_years) - 1)          # 2031/32 ... 2069/70 [match 06]
+
+# z-scored future Hangang covariates of one SSP file, wintering months only (as 06)
+read_future <- function(file) {
+  read.csv(file) %>%
+    mutate(Date_Time  = as.POSIXct(Date_Time, format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+           Han_Temp   = z_ref(Temperature.C.,   "Temp"),
+           Han_Wind   = z_ref(Wind_Speed.m.s.,  "Wind"),
+           Han_SPI6   = z_ref(SPI6_Smooth,      "SPI6"),
+           Han_wTemp  = z_ref(Pred_Water_Temp,  "wTemp"),
+           Han_BOD    = z_ref(Pred_BOD,         "BOD"),
+           Han_DTN    = z_ref(Pred_DTN,         "DTN"),
+           Han_Chlor  = z_ref(Pred_Chlorophyll, "Chlor")) %>%
+    filter(month(with_tz(Date_Time, "Asia/Seoul")) %in% c(10, 11, 12, 1, 2, 3, 4)) %>%
+    select(Station, Date_Time, all_of(han_vars)) %>%
+    na.omit() %>%
+    distinct(Station, Date_Time, .keep_all = TRUE)
+}
+design <- function(d) model.matrix(dyn_formula, as.data.frame(d))[, rownames(ref_beta), drop = FALSE]
+
+# Stationary distribution from exp(eta) (rows x 6, columns 1->2, 1->3, 2->1, 2->3, 3->1, 3->2)
+stat_from_E <- function(E) {
+  r1 <- 1 + E[, 1] + E[, 2]; r2 <- 1 + E[, 3] + E[, 4]; r3 <- 1 + E[, 5] + E[, 6]
+  g12 <- E[, 1] / r1; g13 <- E[, 2] / r1; g21 <- E[, 3] / r2
+  g23 <- E[, 4] / r2; g31 <- E[, 5] / r3; g32 <- E[, 6] / r3
+  p <- cbind(g21 * g31 + g23 * g31 + g32 * g21,
+             g12 * g32 + g13 * g32 + g31 * g12,
+             g13 * g23 + g12 * g23 + g21 * g13)
+  p / rowSums(p)
+}
+eig_stat <- function(x, beta) {
+  eta <- matrix(x %*% beta, 3, 2, byrow = TRUE); G <- matrix(0, 3, 3)
+  for (i in 1:3) { G[i, -i] <- exp(eta[i, ]); G[i, i] <- 1 }
+  G <- G / rowSums(G); e <- eigen(t(G)); v <- Re(e$vectors[, which.min(abs(e$values - 1))]); v / sum(v)
+}
+X_chk <- design(ref_model$data)[1:50, ]
+stopifnot(max(abs(stat_from_E(exp(X_chk %*% ref_beta)) - t(apply(X_chk, 1, eig_stat, beta = ref_beta)))) < 1e-8)
+
+# Every imputation keeps the main data's Station and roundT, so one design serves all imputations
+same_rows <- vapply(use, function(j) {
+  d <- fits[[j]]$dyn$data
+  isTRUE(all.equal(as.numeric(d$roundT), as.numeric(ref_model$data$roundT))) &&
+    identical(as.character(d$Station), as.character(ref_model$data$Station))
+}, logical(1))
+stopifnot("imputed fits do not share the main data's Station/roundT" = all(same_rows))
+```
+
+```{r bout design}
+winter_of <- function(t) { lt <- with_tz(t, "Asia/Seoul"); year(lt) - (month(lt) <= 4) }  # Oct-Apr -> start year
+hd <- as.data.frame(ref_model$data) %>%
+  mutate(ID = as.character(ID), W = winter_of(roundT))
+n_w <- table(hd$W)
+hist_winters <- as.integer(names(n_w)[n_w >= min_hist_steps])
+fc_list <- lapply(ssp_files, function(f) read_future(file.path(ssp_dir, f)))
+
+set.seed(2027)
+h_order <- rep(sample(length(hist_winters)), length.out = length(fut_winters))   # recycled permutation
+
+design_bout <- lapply(seq_along(fut_winters), function(j) {
+  Wf <- fut_winters[j]; Wh <- hist_winters[h_order[j]]
+  h  <- hd %>% filter(W == Wh) %>% arrange(ID, roundT) %>%
+    mutate(Date_Time = roundT + years(Wf - Wh))                  # NA for 29 Feb in non-leap years
+  fut <- lapply(fc_list, function(fc)
+    left_join(h[, c("Station", "Date_Time")], fc, by = c("Station", "Date_Time"), na_matches = "never"))
+  stopifnot(all(vapply(fut, nrow, integer(1)) == nrow(h)))
+  ok <- !is.na(h$Date_Time) & Reduce(`&`, lapply(fut, function(d) complete.cases(d[, han_vars])))
+  hk <- h[ok, ]; n <- nrow(hk)
+  if (n < 2) return(NULL)
+  list(W_fut = Wf, W_hist = Wh, n = n,
+       seg_start = c(TRUE, hk$ID[-1] != hk$ID[-n] | diff(as.numeric(hk$roundT)) > 3660),
+       u = runif(n),                                             # common random numbers
+       X = c(list(Historical = design(hk)), lapply(fut, function(d) design(d[ok, ]))))
+})
+design_bout <- Filter(Negate(is.null), design_bout)
+stopifnot(identical(names(design_bout[[1]]$X), periods))
+
+cat(sprintf("Historical winters used: %s | future winters: %d (%d/%d to %d/%d) | steps per period: %d | segments: %d\n",
+            paste(hist_winters, collapse = ", "), length(design_bout),
+            design_bout[[1]]$W_fut, design_bout[[1]]$W_fut + 1,
+            tail(design_bout, 1)[[1]]$W_fut, tail(design_bout, 1)[[1]]$W_fut + 1,
+            sum(sapply(design_bout, `[[`, "n")), sum(sapply(design_bout, function(d) sum(d$seg_start)))))
+```
+
+```{r bout simulation}
+# Hourly state sequences for all K coefficient draws at once (X: n x p, D: K x 6p)
+sim_bouts <- function(X, D, seg_start, u) {
+  n <- nrow(X); K <- nrow(D); p <- ncol(X); kk <- seq_len(K)
+  E <- exp(X %*% matrix(t(D), p)); dim(E) <- c(n, 6, K)          # E[t, transition, draw]
+  a_of <- c(2L, 1L, 1L); b_of <- c(3L, 3L, 2L)                    # targets of each state's 2 off-diagonals
+  S <- matrix(0L, n, K)
+  for (t in seq_len(n)) {
+    if (seg_start[t]) {
+      P <- stat_from_E(t(matrix(E[t, , ], 6, K)))                 # first state ~ stationary distribution
+    } else {
+      s  <- S[t - 1, ]; e <- matrix(E[t - 1, , ], 6, K)           # transition into t uses covariates at t-1
+      e1 <- e[cbind(2L * s - 1L, kk)]; e2 <- e[cbind(2L * s, kk)]; r <- 1 + e1 + e2
+      P  <- matrix(0, K, 3)
+      P[cbind(kk, s)] <- 1 / r; P[cbind(kk, a_of[s])] <- e1 / r; P[cbind(kk, b_of[s])] <- e2 / r
+    }
+    S[t, ] <- 1L + (u[t] > P[, 1]) + (u[t] > P[, 1] + P[, 2])
+  }
+  S
+}
+# Bouts per day (entries within segments per 24 tracked hours), mean bout (h, runs entirely within a
+# segment) and mean gap between bouts of each state (h, complete runs of other states between two bouts
+# of that state, entirely within a segment; same definition as 06)
+bout_metrics <- function(S, seg_start) {
+  n <- nrow(S); seg_end <- c(seg_start[-1], TRUE)
+  apply(S, 2, function(s) {
+    first <- which(seg_start | c(TRUE, s[-1] != s[-n])); last <- c(first[-1] - 1L, n)
+    rs <- s[first]; len <- last - first + 1L
+    entry <- !seg_start[first]
+    full  <- !seg_start[first] & !seg_end[last]
+    gap <- function(k) {
+      x  <- s == k
+      f2 <- which(seg_start | c(TRUE, x[-1] != x[-n])); l2 <- c(f2[-1] - 1L, n)
+      g  <- (l2 - f2 + 1L)[!x[f2] & !seg_start[f2] & !seg_end[l2]]
+      if (length(g)) mean(g) else NA_real_
+    }
+    c(tabulate(rs[entry], 3) * 24 / n,
+      vapply(1:3, function(k) { x <- len[full & rs == k]; if (length(x)) mean(x) else NA_real_ }, numeric(1)),
+      vapply(1:3, gap, numeric(1)))
+  })
+}
+# One imputation: metric x period x draw, averaged over paired winters within each draw
+bout_one <- function(b, V, Z, des) {
+  R <- with(eigen(V, symmetric = TRUE), vectors %*% (sqrt(pmax(values, 0)) * t(vectors)))
+  D <- sweep(Z %*% R, 2, c(b), "+")
+  arr <- array(NA_real_, c(length(metric_names), length(des[[1]]$X), length(des), nrow(Z)))
+  for (w in seq_along(des)) for (pp in seq_along(des[[w]]$X)) {
+    d <- des[[w]]
+    arr[, pp, w, ] <- bout_metrics(sim_bouts(d$X[[pp]], D, d$seg_start, d$u), d$seg_start)
+  }
+  out <- apply(arr, c(1, 2, 4), mean, na.rm = TRUE)
+  dimnames(out) <- list(metric_names, names(des[[1]]$X), NULL)
+  out
+}
+bout_task <- function(tk) {
+  if (file.exists(tk$file)) return(readRDS(tk$file))
+  res <- bout_one(tk$b, tk$V, Z_bout, design_bout)
+  saveRDS(res, tk$file)
+  res
+}
+
+set.seed(2028)
+Z_bout <- matrix(rnorm(n_draws * length(ref_beta)), n_draws)   # shared deviates for every imputation
+
+bout_tasks <- lapply(use, function(j)   # delete the cached files if the design or settings change
+  list(j = j, b = fits[[j]]$dyn$mle$beta, V = beta_vcov(fits[[j]]$dyn),
+       file = file.path(paths$out_dir, sprintf("mi_%s_bouts_m%d_%s_K%d.rds",            # m9 = with gap metrics
+                                               run_tag, length(metric_names), j, n_draws))))
+
+cl <- makeCluster(n_cores)
+clusterExport(cl, c("stat_from_E", "sim_bouts", "bout_metrics", "bout_one",
+                    "design_bout", "Z_bout", "metric_names"), envir = environment())
+bout_res <- tryCatch(parLapplyLB(cl, bout_tasks, bout_task), finally = stopCluster(cl))
+names(bout_res) <- vapply(bout_tasks, `[[`, character(1), "j")
+```
+
+```{r pool bouts}
+contrast_draws <- function(res, mt, s) res[mt, s, ] - res[mt, "Historical", ]
+
+bout_mi <- bind_rows(lapply(scenarios, function(s) bind_rows(lapply(metric_names, function(mt) {
+  dj <- sapply(use, function(j) contrast_draws(bout_res[[j]], mt, s))            # draws x imputations
+  r  <- rubin(colMeans(dj, na.rm = TRUE), apply(dj, 2, var, na.rm = TRUE))
+  tibble(Metric    = factor(sub(" \\|.*", "", mt), levels = metric_types),
+         Behavior  = factor(sub(".*\\| ", "", mt), levels = behav),
+         contrast  = paste0(s, ": (Future - Historical)"),
+         Pooled_MI = r[["Est"]],
+         Lower_MI  = r[["Lower"]],
+         Upper_MI  = r[["Upper"]])
+})))) %>%
+  arrange(Metric, Behavior, contrast)
+
+print(bout_mi %>% mutate(across(where(is.numeric), ~ round(., 3))), width = Inf, n = Inf)
+cat(sprintf("\nm = %d imputations, %d draws each\n", m, n_draws))
+#write.csv(bout_mi, file.path(paths$out_dir, paste0("mi_", run_tag, "_bout_pooled.csv")), row.names = FALSE)
+```
+
+
+
+

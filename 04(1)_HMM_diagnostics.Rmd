@@ -1,0 +1,407 @@
+---
+title: "Crane HMM diagnostics: state number, multiple initialisations"
+author: "Youn Jae Kang"
+output: html_document
+---
+
+Supplement to `04_Hangang_Crane_dynHMM.Rmd`.
+
+**Multistart fits of the base model** 30 random starts(round 1), then 10 perturbed starts around the fits (round 2).
+**Model comparison** of K = 2-4: AIC/BIC, log-likelihood, state persistence, coefficients.
+
+```{r setup, message=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lubridate)
+library(momentuHMM)
+library(parallel)
+library(pbmcapply)
+library(R.utils)
+
+data_csv <- "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/04_Hangang_Crane_dynHMM/global_hmm_data_UTC.csv"
+out_dir  <- "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/HMM_statenum_init"   # fits and tables
+pars_out <- "/Users/yjkang/Desktop/HMM_fixed_state_pars.rds"                      # read by 04
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+K_set         <- 2:4        # candidate state numbers
+n_start       <- 30         # round 1: random starts per K
+K_refine      <- 3:4        # round 2: K values refitted
+n_refine      <- 10         # round 2: perturbed starts per K
+round2_tag    <- "r2v"      # round-2 label (file prefix).
+tol           <- 0.1        # log-likelihood units
+conc_max      <- 100        # turning-angle concentration threshold above which is practically straight line.
+fit_timeout_s <- 12 * 3600  # per-fit time limit (seconds)
+n_cores       <- max(1, detectCores() - 1)
+
+# start from 04
+global_step_km <- c(45.0, 8.0, 0.02, 10.0, 6.5, 0.01)
+global_angle   <- c(0, pi, 0, 8.0, 0.5, 0.1)
+
+# parameters of 04
+old_step  <- c(5.927842, 0.3972410, 0.04351320, 8.558490, 0.3196354, 0.04634466)
+old_angle <- c(-0.004563477, 0.008767228, -0.008541543, 0.755783352, 1.390751093, 0.691495849)
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+safe_min <- function(x) if (length(x) && any(!is.na(x))) min(x, na.rm = TRUE) else NA_real_
+```
+
+# 1. Data
+
+```{r load-data}
+raw  <- read.csv(data_csv, stringsAsFactors = FALSE)
+need <- c("ID", "time", "step", "angle", "In_Hangang")
+miss <- setdiff(need, names(raw))
+if (length(miss)) stop("Columns missing from data_csv: ", paste(miss, collapse = ", "))
+
+raw$ID <- factor(raw$ID)
+tt  <- suppressWarnings(ymd_hms(raw$time, tz = "UTC"))    
+bad <- is.na(tt)
+if (any(bad)) tt[bad] <- parse_date_time(raw$time[bad], orders = c("Ymd HM", "Ymd"), tz = "UTC")
+raw$time <- tt
+stopifnot(!anyNA(raw$time))
+
+# Positions far from any GPS fix
+hi_se <- NULL
+if (all(c("se.mu.x", "se.mu.y") %in% names(raw))) {
+  hi_se <- pmax(raw$se.mu.x, raw$se.mu.y) > 300
+  hi_se[is.na(hi_se)] <- FALSE
+}
+dat <- raw
+class(dat) <- c("momentuHMMData", "data.frame")
+
+local_hr <- hour(with_tz(dat$time, "Asia/Seoul"))
+dt_h <- dat %>% as.data.frame() %>% group_by(ID) %>%
+  summarise(d = median(as.numeric(diff(time), units = "hours"), na.rm = TRUE)) %>%
+  pull(d) %>% median(na.rm = TRUE)
+
+cat("Rows:", nrow(dat), "| tracks:", nlevels(dat$ID),
+    "| non-missing steps:", sum(!is.na(dat$step)), "| median time step (h):", dt_h, "\n")
+
+#par(mfrow = c(1, 2))
+#ist(log(dat$step), breaks = 100, main = "log step (km)")
+#hist(dat$angle, breaks = 100, main = "turning angle")
+#par(mfrow = c(1, 1))
+
+chk <- list.files(out_dir, "^base_r[0-9a-z]+_K[0-9]+_s[0-9]+\\.rds$", full.names = TRUE)
+for (f in chk) {
+  d0 <- tryCatch(readRDS(f)$data, error = function(e) NULL)
+  if (is.null(d0)) next
+  same <- nrow(d0) == nrow(dat) &&
+    identical(as.character(d0$ID), as.character(dat$ID)) &&
+    isTRUE(all.equal(d0$step,  dat$step,  tolerance = 1e-8)) &&
+    isTRUE(all.equal(d0$angle, dat$angle, tolerance = 1e-8))
+  if (!same) stop("The data differ from the data in cached fit ", basename(f),
+                  ". Check the CSV (rows, steps, angles) or clear out_dir.")
+  shift_h <- (as.numeric(dat$time) - as.numeric(d0$time)) / 3600
+  is_br   <- startsWith(as.character(dat$ID), "br")
+  cat("Data match cached fit", basename(f), "| time shift (h): br tags",
+      paste(unique(round(shift_h[is_br], 6)), collapse = ", "), "| 27233947",
+      paste(unique(round(shift_h[!is_br], 6)), collapse = ", "), "\n")
+  if (any(abs(shift_h[!is_br]) > 1e-6) || any(abs(shift_h[is_br]) > 1e-6 & abs(shift_h[is_br] + 9) > 1e-6))
+    stop("Times differ from the cached fit by something other than the KST correction (-9 h, br tags only).")
+  break
+}
+```
+
+# 2. Multistart fits of the base model
+
+```{r helpers}
+reorder_par <- function(par, ord) {
+  K <- length(ord)
+  list(step  = c(par$step[ord],  par$step[K + ord]),
+       angle = c(par$angle[ord], par$angle[K + ord]))
+}
+
+state_pars <- function(m) {
+  K   <- length(m$stateNames)
+  p   <- getPar0(m)$Par
+  ord <- order(p$step[1:K], decreasing = TRUE)
+  list(K = K, ord = ord, pars = reorder_par(p, ord))
+}
+
+draw_par0 <- function(K) {
+  mu  <- sort(exp(runif(K, log(0.01), log(30))), decreasing = TRUE)  # km per step
+  sdv <- mu * runif(K, 0.5, 1.5)
+  kap <- runif(K, 0.1, 5)
+  list(step = c(mu, sdv), angle = c(rep(0, K), kap))
+}
+
+# Perturb a fitted parameter set by +/-20% (turning-angle means unchanged)
+perturb_par <- function(p, K) {
+  list(step  = p$step * runif(2 * K, 0.8, 1.2),
+       angle = c(p$angle[1:K], p$angle[K + 1:K] * runif(K, 0.8, 1.2)))
+}
+
+# Fit one job, or load it if cached
+fit_one <- function(job) {
+  f <- file.path(out_dir, sprintf("base_%s_K%d_s%02d.rds", job$round, job$K, job$s))
+  status <- "fitted"
+  m <- if (file.exists(f)) tryCatch(readRDS(f), error = function(e) NULL) else NULL
+  if (is.null(m) && exists("load_only") && load_only && job$round == "r1") {
+    return(data.frame(round = job$round, K = job$K, start = job$s, file = NA_character_,
+                      status = "not saved (error or time-out)"))
+  }
+  if (is.null(m)) {
+    m <- tryCatch(
+      R.utils::withTimeout(
+        fitHMM(data = dat, nbStates = job$K,
+               dist = list(step = "gamma", angle = "vm"),
+               Par0 = job$par0, beta0 = job$beta0,
+               estAngleMean = list(angle = TRUE), formula = ~ 1),
+        timeout = fit_timeout_s),
+      TimeoutException = function(e) { status <<- "timed out"; NULL },
+      error = function(e) { status <<- "error"; NULL })
+    if (!is.null(m)) saveRDS(m, f)
+  }
+  row <- data.frame(round = job$round, K = job$K, start = job$s, file = NA_character_, status = status)
+  if (is.null(m)) return(row)
+  if (!is.finite(m$mod$minimum) || m$mod$minimum > 1e300) {
+    row$status <- "failed (likelihood not finite at start)"
+    return(row)
+  }
+  sp <- state_pars(m); K <- sp$K
+  row$file <- f
+  cbind(row,
+        data.frame(nll = m$mod$minimum, code = m$mod$code, n_par = length(m$mod$estimate),
+                   iterations = m$mod$iterations %||% NA,
+                   elapsed_h  = as.numeric(m$mod$elapsedTime %||% NA) / 3600,
+                   max_conc   = max(sp$pars$angle[K + 1:K])),
+        as.data.frame(as.list(setNames(sp$pars$step[1:K], paste0("mu_", 1:K)))))
+}
+
+run_jobs <- function(jobs) {
+  res <- pbmclapply(jobs, fit_one, mc.cores = n_cores, mc.preschedule = FALSE)
+  bind_rows(Filter(is.data.frame, res))
+}
+
+load_only <- TRUE
+```
+
+## 2.1 Round 1: random starts
+
+```{r round1}
+set.seed(2026)
+jobs1 <- list()
+for (K in 1:max(K_set)) for (s in seq_len(n_start)) {   # K = 1 draws kept so the random stream matches the cached fits
+  p0 <- if (K == 3 && s == 1) list(step = global_step_km, angle = global_angle) else draw_par0(K)
+  if (K %in% K_set) jobs1[[length(jobs1) + 1]] <- list(round = "r1", K = K, s = s, par0 = p0, beta0 = NULL)
+}
+t0 <- Sys.time()
+ms1 <- run_jobs(jobs1) %>%
+  mutate(valid = status == "fitted" & !is.na(max_conc) & max_conc <= conc_max)
+print(Sys.time() - t0)
+print(count(ms1, K, status))
+```
+
+## 2.2 Round 2: 10 further refits
+
+```{r round2}
+# this checks the convergence is stable, no flat or saddle convergence.
+set.seed(2028)
+jobs2 <- list()
+for (K in K_refine) {
+  b <- ms1 %>% filter(K == !!K, valid) %>% slice_min(nll, n = 1, with_ties = FALSE)
+  if (!nrow(b)) { warning("No valid round-1 fit for K = ", K, "; round 2 skipped for this K"); next }
+  p0 <- getPar0(readRDS(b$file))
+  for (s in seq_len(n_refine)) {
+    jobs2[[length(jobs2) + 1]] <- list(
+      round = round2_tag, K = K, s = s,
+      par0  = perturb_par(p0$Par, K),
+      beta0 = p0$beta + rnorm(length(p0$beta), 0, 0.2))
+  }
+}
+t0 <- Sys.time()
+ms2 <- run_jobs(jobs2) %>%
+  mutate(valid = status == "fitted" & !is.na(max_conc) & max_conc <= conc_max)
+print(Sys.time() - t0)
+```
+
+```{r multistart-summary}
+planned <- bind_rows(
+  expand.grid(round = "r1",       K = K_set,    start = seq_len(n_start),  stringsAsFactors = FALSE),
+  expand.grid(round = round2_tag, K = K_refine, start = seq_len(n_refine), stringsAsFactors = FALSE))
+
+ms <- planned %>%
+  left_join(bind_rows(ms1, ms2), by = c("round", "K", "start")) %>%
+  mutate(status = ifelse(is.na(status), "not run", status),
+         valid  = !is.na(valid) & valid,
+         degenerate = status == "fitted" & !valid) %>%
+  group_by(K) %>%
+  mutate(best_valid_nll = safe_min(nll[valid]),
+         dnll = ifelse(valid, nll - best_valid_nll, NA_real_)) %>%   # NA for degenerate / failed fits
+  ungroup()
+#write.csv(ms, file.path(out_dir, "multistart_base_all.csv"), row.names = FALSE)
+
+next_gap <- function(nll, dnll) {
+  u <- sort(unique(round(nll[!is.na(dnll) & dnll >= tol], 2)))
+  if (length(u)) u[1] - min(nll, na.rm = TRUE) else NA_real_
+}
+
+ms_summary <- ms %>%
+  group_by(K) %>%
+  summarise(
+    r1_starts      = sum(round == "r1"),
+    n_converged    = sum(valid & code %in% 1:2),
+    logLik    = -safe_min(nll[valid]),
+    gap_to_next    = next_gap(nll[valid], dnll[valid]),
+    .groups = "drop")
+print(ms_summary)
+#write.csv(ms_summary, file.path(out_dir, "TableS_multistart_summary.csv"), row.names = FALSE)
+```
+
+## 2.3 Stability check for 3-state
+
+```{r k3-agreement}
+k3_fits    <- ms %>% filter(K == 3, valid)
+best_nll3  <- min(k3_fits$nll)
+k3_at_best <- k3_fits %>%
+  mutate(d_best = nll - best_nll3) %>%
+  filter(d_best < tol) %>%
+  arrange(nll)                                   # row 1 = best fit
+stopifnot(nrow(k3_at_best) >= 1, all(k3_at_best$d_best >= 0))
+
+par_names <- c(paste0("step_mean_", 1:3), paste0("step_sd_", 1:3),
+               paste0("angle_mean_", 1:3), paste0("angle_conc_", 1:3))
+par_k3 <- bind_rows(lapply(seq_len(nrow(k3_at_best)), function(i) {
+  p <- state_pars(readRDS(k3_at_best$file[i]))$pars          # state 1 = longest steps
+  data.frame(round = k3_at_best$round[i], start = k3_at_best$start[i],
+             d_best = k3_at_best$d_best[i],
+             as.list(setNames(c(p$step, p$angle), par_names)))
+}))
+
+agree_k3 <- data.frame(
+  parameter = par_names,
+  original_04 = c(old_step, old_angle),
+  best_fit  = unlist(par_k3[1, par_names]),
+  min       = sapply(par_names, function(v) min(par_k3[[v]])),
+  max       = sapply(par_names, function(v) max(par_k3[[v]])),
+  row.names = NULL) %>%
+  mutate(range = max - min,
+         original_in_range = original_04 >= min - 1e-4 * abs(original_04) &
+                             original_04 <= max + 1e-4 * abs(original_04))
+
+print(agree_k3, digits = 4)
+#write.csv(agree_k3, file.path(out_dir, "TableS_K3_parameter_agreement.csv"), row.names = FALSE)
+```
+
+# 3. Comparison of the 2-, 3- and 4-state models
+
+```{r best-fits}
+# Best VALID fit for each K (lowest negative log-likelihood across both rounds)
+best <- list()
+for (k in K_set) {
+  b <- ms %>% filter(K == k, valid) %>% slice_min(nll, n = 1, with_ties = FALSE)
+  if (!nrow(b)) { warning("No valid fit for K = ", k, "; left out of the comparison"); next }
+  best[[paste0("K", k)]] <- readRDS(b$file)
+}
+
+# n for BIC: time steps with at least one observed data stream
+n_obs <- with(dat, sum(!is.na(step) | !is.na(angle)))
+# Rows used to cross-tabulate the K = 3 and K = 4 Viterbi paths: time steps with an observed step
+kept  <- !is.na(dat$step)
+```
+
+```{r selection-tables}
+sel_tab <- list(); state_tab <- list(); vit_all <- list(); gam_all <- list()
+
+for (nm in names(best)) {
+  m   <- best[[nm]]
+  sp  <- state_pars(m); K <- sp$K; ord <- sp$ord; pp <- sp$pars
+  g   <- CIreal(m)$gamma$est[ord, ord]
+  dl  <- stationary(m)[[1]][1, ord]
+  vit <- match(viterbi(m), ord)          # relabelled: 1 = longest steps
+  vit_all[[nm]] <- vit
+  gam_all[[nm]] <- g
+  nll <- m$mod$minimum
+  k   <- length(m$mod$estimate)
+
+  sel_tab[[nm]] <- data.frame(
+    K = K, n_par = k, logLik = -nll,
+    AIC = 2 * nll + 2 * k, BIC = 2 * nll + k * log(n_obs),
+    dwell_h     = paste(sprintf("%.1f", dt_h / (1 - diag(g))), collapse = " / "),
+    stationary  = paste(sprintf("%.2f", dl), collapse = " / "))
+
+  state_tab[[nm]] <- data.frame(
+    K = K, state = 1:K,
+    step_mean_km = pp$step[1:K], step_sd_km = pp$step[K + 1:K],
+    angle_mean = pp$angle[1:K], angle_conc = pp$angle[K + 1:K],
+    viterbi_share = as.numeric(table(factor(vit, levels = 1:K))) / length(vit),
+    hangang_share = sapply(1:K, function(s) mean(dat$In_Hangang[vit == s] == 1)))
+}
+
+sel_tab <- bind_rows(sel_tab) %>%
+  mutate(dAIC = AIC - min(AIC), dBIC = BIC - min(BIC)) %>%
+  select(K, n_par, logLik, AIC, dAIC, BIC, dBIC, dwell_h, stationary)
+state_tab <- bind_rows(state_tab)
+
+print(sel_tab)
+print(state_tab, digits = 3)
+#write.csv(sel_tab,   file.path(out_dir, "TableS_state_selection.csv"),  row.names = FALSE)
+#write.csv(state_tab, file.path(out_dir, "TableS_state_parameters.csv"), row.names = FALSE)
+```
+
+## 4.1 State persistence
+
+Persistence is the probability of staying in a state from one time step to the next, i.e. the diagonal of the
+transition probability matrix (gamma_ii). The number of consecutive steps spent in state i is geometric, so the
+mean dwell time is 1 / (1 - gamma_ii) steps.
+```{r persistence}
+pers_models <- best                      # all K; use list(K3 = best$K3) for the selected model only
+cat("Median time step:", dt_h, "h\n")
+
+pers_tab <- bind_rows(lapply(names(pers_models), function(nm) {
+  m   <- pers_models[[nm]]
+  sp  <- state_pars(m); K <- sp$K; ord <- sp$ord     # state 1 = longest steps
+  g   <- CIreal(m)$gamma$est[ord, ord]
+  gii <- diag(g)
+  data.frame(model = nm, K = K, state = 1:K,
+             step_mean_km = sp$pars$step[1:K],
+             persistence  = gii,                      # gamma_ii
+             dwell_steps  = 1 / (1 - gii),            # mean dwell time in time steps
+             dwell_h      = dt_h / (1 - gii))         # same, in hours
+}))
+if ("K3" %in% names(pers_models))                     # label the selected model's states
+  pers_tab$behaviour <- ifelse(pers_tab$K == 3, c("Travel", "Forage", "Roost")[pers_tab$state], NA)
+print(pers_tab, digits = 3)
+#write.csv(pers_tab, file.path(out_dir, "TableS_state_persistence.csv"), row.names = FALSE)
+```
+
+## 4.2 Confidence intervals for persistence and dwell time
+
+95% CIs for gamma_ii come from `CIreal()` (delta method on the logit-scale transition coefficients, back-transformed
+to the probability scale, so the bounds stay within 0-1). Because 1 / (1 - x) increases monotonically in x, the
+dwell-time CI is obtained by transforming the persistence bounds directly.
+```{r persistence-ci}
+pers_ci <- bind_rows(lapply(names(pers_models), function(nm) {
+  m  <- pers_models[[nm]]
+  sp <- state_pars(m); K <- sp$K; ord <- sp$ord
+  ci <- tryCatch(CIreal(m, alpha = 0.95)$gamma, error = function(e) NULL)
+  if (is.null(ci)) { warning("CIreal failed for ", nm); return(NULL) }
+  est <- diag(ci$est[ord, ord]); lo <- diag(ci$lower[ord, ord]); up <- diag(ci$upper[ord, ord])
+  data.frame(model = nm, K = K, state = 1:K,
+             persistence = est, pers_lower = lo, pers_upper = up,
+             dwell_steps = 1 / (1 - est), dwell_steps_lower = 1 / (1 - lo), dwell_steps_upper = 1 / (1 - up),
+             dwell_h     = dt_h / (1 - est), dwell_h_lower = dt_h / (1 - lo), dwell_h_upper = dt_h / (1 - up))
+}))
+print(pers_ci, digits = 3)
+
+# NaN/NA bounds mean the Hessian could not be inverted for that model (e.g. a state with no time steps
+# assigned); report point estimates only for that model.
+if (anyNA(pers_ci[, c("pers_lower", "pers_upper")]))
+  cat("Models with missing CIs:", paste(unique(pers_ci$model[is.na(pers_ci$pers_lower)]), collapse = ", "), "\n")
+
+# One line per state for the text / Table S
+pers_ci %>%
+  filter(K == 3) %>%
+  mutate(behaviour = c("Travel", "Forage", "Roost")[state],
+         text = sprintf("%s: gamma_ii = %.3f (95%% CI %.3f-%.3f); mean dwell = %.1f steps (%.1f-%.1f) = %.1f h (%.1f-%.1f)",
+                        behaviour, persistence, pers_lower, pers_upper,
+                        dwell_steps, dwell_steps_lower, dwell_steps_upper,
+                        dwell_h, dwell_h_lower, dwell_h_upper)) %>%
+  pull(text) %>% cat(sep = "\n")
+#write.csv(pers_ci, file.path(out_dir, "TableS_state_persistence_CI.csv"), row.names = FALSE)
+```
+
+
+

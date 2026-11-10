@@ -1,0 +1,1130 @@
+---
+title: "BigData_Wetland_migratoryBirds"
+author: "Youn Jae Kang"
+date: "2026-04-06"
+output: html_document
+---
+
+What factor of a wetland affects migratory birds? and if the factor changes in the future, how will behaviour change?
+
+Time conventions: GPS times in HMM_Ready_Crane_combined.csv are UTC (03 converts the br tags' KST clock;
+27233947 is UTC from Movebank). Climate, water-chemistry and SPI6 times are local (KST) and converted to UTC below.
+
+```{r load package, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(readxl)
+library(tidyr)
+crane_data <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/HMM_Ready_Crane_combined_UTC.csv")
+```
+
+```{r}
+options(download.file.method = "libcurl")
+library(sf)
+library(geodata)
+
+kor_muni <- st_as_sf(gadm(country = "KOR", level = 2, path = tempdir()))
+prk_prov <- st_as_sf(gadm(country = "PRK", level = 1, path = tempdir()))
+kor_country <- st_as_sf(gadm(country = "KOR", level = 0, path = tempdir()))
+prk_country <- st_as_sf(gadm(country = "PRK", level = 0, path = tempdir()))
+
+# South Korea
+kor_target <- kor_muni %>%
+  filter(grepl("Paju|Goyang|Gimpo|Yeoncheon|Cheorwon|Pocheon", NAME_2, ignore.case = T) )%>% #|
+         #grepl("Incheon", NAME_1, ignore.case = T)) %>%
+  st_transform(crs = 32649)
+
+# North Korea
+prk_target <- prk_prov %>%
+  filter(grepl("Kaesong|Gaesung|Gesung|Kesung|Gaeseong|Kaeseong", NAME_1, ignore.case = T)) %>%
+  st_transform(crs = 32649)
+
+# DMZ
+kor_utm_border <- st_transform(kor_country, crs = 32649)
+prk_utm_border <- st_transform(prk_country, crs = 32649)
+# Find the touching border (MDL) and buffer it by 2km to create the DMZ
+prk_lines <- st_cast(prk_utm_border, "MULTILINESTRING")
+mdl_line <- st_intersection(prk_lines, st_buffer(kor_utm_border, 100))
+dmz_polygon <- st_buffer(mdl_line, dist = 2000)
+
+master_boundary <- st_union(kor_target) %>%
+  st_union(prk_target) %>%
+  st_union(dmz_polygon)
+```
+
+```{r}
+crane_sf <- st_as_sf(crane_data, coords = c("x", "y"), crs = 32649, remove = FALSE)
+crane_target_region <- st_intersection(crane_sf, master_boundary)
+
+p_final_map <- ggplot() +
+  #geom_sf(data = kor_country, fill = "gray95", color = "gray50", linewidth = 0.5) +
+  geom_sf(data = kor_target, fill = "gray95", color = "gray50", linewidth = 0.2) +
+  geom_sf(data = prk_target, fill = "gray95", color = "gray50", linewidth = 0.2) +
+  geom_sf(data = dmz_polygon, fill = "firebrick", color = NA, alpha = 0.25) +
+  geom_sf(data = crane_target_region, color = "gray30", size = 0.5, alpha = 0.1, shape=16) +
+  theme_bw() +
+  labs(title = "Crane Wintering on Han River",
+       subtitle = "red area refers to 4km DMZ buffer",
+       x = "",y = "", color = NULL) +
+  theme(legend.position = "right", plot.title = element_text(face = "bold", size = 14, hjust=0.5),
+        plot.subtitle = element_text(size = 11, hjust=0.5),
+        panel.grid.major = element_line(color = "gray90", linetype = "dashed"),
+        panel.background = element_rect(fill = "white"))
+print(p_final_map)
+#ggsave("/Users/yjkang/Desktop/Hangang_estuary.pdf", plot = p_final_map)
+```
+
+# Hangang subset region assignment
+```{r}
+crane_deg <- st_transform(crane_target_region, crs = 4326)
+lon_coords <- st_coordinates(crane_deg)[, 1]
+
+crane_Hangang_df <- as.data.frame(crane_target_region) %>%
+  select(-geometry) %>%  #Drop the geometry so it's ready for the temporal merge
+  mutate(
+    time = as.POSIXct(time, format="%Y-%m-%d %H:%M", tz = "UTC"),
+    #Round the 30-min GPS time to the nearest Hour for merging
+    Join_Time = lubridate::round_date(time, "30 min"),
+    # Assign the station
+    Station = ifelse(lon_coords <= 126.875, "Paju", "Cheorwon")
+  )%>%
+  arrange(ID, time)
+
+cat("\nTotal Crane GPS points:", nrow(crane_data))
+cat("\nPoints physically in the Hangang region:", nrow(crane_Hangang_df), "\n")
+```
+
+# ==========================================
+# Match corresponding climate to GPS data
+# ==========================================
+```{r}
+library(lubridate)
+
+paju_clim <- read.csv("/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/hourly_climate/paju_climate_2014_2024.csv")
+cheorwon_clim <- read.csv("/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/hourly_climate/cheorwon_climate_2014_2024.csv")
+climate_all <- bind_rows(paju_clim, cheorwon_clim)
+
+# THE TIMEZONE FIX:
+climate_all <- climate_all %>%
+  mutate(
+    # Step A: Parse the text as KST (Asia/Seoul)
+    Date_Time = as.POSIXct(Date_Time, format="%Y-%m-%d %H:%M", tz="Asia/Seoul"),
+    Date_Time = with_tz(Date_Time, format="%Y-%m-%d %H:%M", tzone = "UTC")
+  )
+
+#interpolate 30 minutes
+climate_all <- climate_all %>%
+  group_by(Station) %>%
+  # 'complete' generates the 30-min sequence for each group's time range
+  complete(Date_Time = seq(min(Date_Time), max(Date_Time), by = "30 min")) %>%
+  # linear interpolation
+  mutate(across(where(is.numeric), ~zoo::na.approx(., na.rm = FALSE))) %>%
+  ungroup()
+```
+
+# MERGE CRANE DATA WITH CLIMATE DATA
+```{r}
+#for Hangang region only
+crane_covariates <- crane_Hangang_df %>%
+  left_join(climate_all, by = c("Station" = "Station", "Join_Time" = "Date_Time")) %>%
+  select(-Join_Time) # Clean up the temporary key
+
+print(table(crane_covariates$Station))
+head(crane_covariates)
+```
+
+# INTERPOLATE temporal resolution
+```{r}
+library(zoo) # For the na.approx() interpolation function
+
+water_chem <- read.csv("/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/water_Chem_paju_cheorwon_2016_2024.csv")
+drought <- read.csv("/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/daily_drought/cheorwon_paju_spi6_2016_2024.csv")
+
+water_prep <- water_chem %>%
+  mutate(
+    Date = as.Date(Date, format = "%Y.%m.%d"),
+    Env_Time = as.POSIXct(paste(Date, "12:00:00"), tz = "Asia/Seoul"),
+    Env_Time = with_tz(Env_Time, tzone = "UTC")
+  ) %>%
+  select(Station, Env_Time, BOD, Chlorophyll, DTN, Water_Temperature)
+drought_prep <- drought %>%
+  mutate(
+    Date = as.Date(Date_Time),
+    Env_Time = as.POSIXct(paste(Date, "12:00:00"), tz = "Asia/Seoul"),
+    Env_Time = with_tz(Env_Time, tzone = "UTC")
+  ) %>%
+  select(Station, Env_Time, SPI6)
+
+# Find the absolute start and end of your crane data
+# (Padding by a few days to ensure the calendar covers everything)
+min_time <- floor_date(min(crane_covariates$time, na.rm = TRUE), "day") - days(2)
+max_time <- ceiling_date(max(crane_covariates$time, na.rm = TRUE), "day") + days(2)
+
+# Create an empty grid of every single hour for both stations
+hourly_calendar <- expand.grid(
+  Env_Time = seq(min_time, max_time, by = "30 min"),
+  Station = c("Paju", "Cheorwon"),
+  stringsAsFactors = FALSE
+)
+```
+
+```{r}
+master_env_smooth <- hourly_calendar %>%
+  # Attach our Noon anchor points
+  left_join(water_prep, by = c("Station", "Env_Time")) %>%
+  left_join(drought_prep, by = c("Station", "Env_Time")) %>%
+  # Group by station so Paju and Cheorwon don't accidentally mix!
+  arrange(Station, Env_Time) %>%
+  group_by(Station) %>%
+  mutate(
+    Water_Temp_Smooth  = na.spline(Water_Temperature, na.rm = FALSE), #na.approx=linear approx, na.spline=polynomial
+    BOD_Smooth         = na.spline(BOD, na.rm = FALSE), #, rule = 1
+    Chlorophyll_Smooth = na.spline(Chlorophyll, na.rm = FALSE),
+    DTN_Smooth         = na.spline(DTN, na.rm = FALSE),
+    SPI6_Smooth        = na.spline(SPI6, na.rm = FALSE),
+    #rule = 1, If the hourly time is before the first record or after the last record, force it to NA.
+    Water_Temp_Smooth  = ifelse(Env_Time < min(Env_Time[!is.na(Water_Temperature)]) |
+                                Env_Time > max(Env_Time[!is.na(Water_Temperature)]),
+                                NA, Water_Temp_Smooth),
+    BOD_Smooth         = ifelse(Env_Time < min(Env_Time[!is.na(BOD)]) |
+                                Env_Time > max(Env_Time[!is.na(BOD)]),
+                                NA, BOD_Smooth),
+    Chlorophyll_Smooth = ifelse(Env_Time < min(Env_Time[!is.na(Chlorophyll)]) |
+                                Env_Time > max(Env_Time[!is.na(Chlorophyll)]),
+                                NA, Chlorophyll_Smooth),
+    DTN_Smooth         = ifelse(Env_Time < min(Env_Time[!is.na(DTN)]) |
+                                Env_Time > max(Env_Time[!is.na(DTN)]),
+                                NA, DTN_Smooth),
+    SPI6_Smooth        = ifelse(Env_Time < min(Env_Time[!is.na(SPI6)]) |
+                                Env_Time > max(Env_Time[!is.na(SPI6)]),
+                                NA, SPI6_Smooth)
+  ) %>%
+  ungroup() #%>%
+  # Keep only the smoothed columns
+  #select(Station, Env_Time, Water_Temp_Smooth, BOD_Smooth, Chlorophyll_Smooth, DTN_Smooth, SPI6_Smooth)
+
+# MERGE WITH Hangang CRANE DATA
+crane_covariates <- crane_covariates %>%
+  mutate(
+    # Recreate the hourly join key for your 30-min GPS points
+    Join_Time = round_date(time, "30 min")
+  ) %>%
+  left_join(master_env_smooth, by = c("Station" = "Station", "Join_Time" = "Env_Time")) %>%
+  select(-Join_Time) # Clean up the temporary key
+
+head(crane_covariates %>% select(time, Station, SPI6_Smooth, Water_Temp_Smooth))
+#write_csv(crane_covariates, "/Users/yjkang/Desktop/Crane_covariates_UTC.csv")
+```
+
+```{r, fig.width=6.5, fig.height=5.5}
+# Visualise smoothing
+# Rename the smooth columns to match the original names, then pivot into a long format
+smooth_long <- master_env_smooth %>%
+  select(-Water_Temperature, -BOD, -Chlorophyll, -DTN, -SPI6) %>%
+  rename(
+    Water_Temperature = Water_Temp_Smooth,
+    BOD               = BOD_Smooth,
+    Chlorophyll       = Chlorophyll_Smooth,
+    DTN               = DTN_Smooth,
+    SPI6              = SPI6_Smooth) %>%
+  pivot_longer(
+    cols = c(Water_Temperature, BOD, Chlorophyll, DTN, SPI6),
+    names_to = "Variable",
+    values_to = "Smooth_Value")
+
+water_long <- water_prep %>%
+  select(Station, Env_Time, Water_Temperature, BOD, Chlorophyll, DTN) %>%
+  pivot_longer(
+    cols = c(Water_Temperature, BOD, Chlorophyll, DTN),
+    names_to = "Variable",
+    values_to = "Original_Value")
+drought_long <- drought_prep %>%
+  select(Station, Env_Time, SPI6) %>%
+  pivot_longer(
+    cols = c(SPI6),
+    names_to = "Variable",
+    values_to = "Original_Value")
+anchors_long <- bind_rows(water_long, drought_long)
+
+p_all <- ggplot() +
+  geom_line(data = smooth_long,
+            aes(x = Env_Time, y = Smooth_Value),
+            color = "dodgerblue", linewidth = 0.6, alpha=0.6) +
+  geom_point(data = anchors_long,
+             aes(x = Env_Time, y = Original_Value),
+             color = "black", shape=16, size = 0.5) +
+  facet_grid(Variable ~ Station, scales = "free_y") +
+  theme_bw() +
+  labs(title = "Blue line = interpolated hourly splines | Black dots = original records",
+       x = "Time", y="") +
+  theme(plot.title = element_text(size = 11, hjust = 0.5),
+        strip.text = element_text(face = "bold", size = 10),
+        strip.background = element_rect(fill = "gray90"))
+print(p_all)
+#ggsave("/Users/yjkang/Desktop/waterChem_interpolated.pdf", plot = p_all)
+```
+
+# ==================
+#   dynamic HMM
+# ==================
+```{r}
+crane_covs <- crane_covariates #read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/GPScrane_covariates.csv")  #crane_covariates
+crane_covs <- crane_covs %>%
+  select(-Precipitation.mm., -Local_Pressure.hPa., -Water_Temperature, -BOD, -Chlorophyll, -DTN, -SPI6) %>%
+  rename(
+    Temp     = 'Temperature.C.',
+    Wind     = 'Wind_Speed.m.s.',
+    Chlor = 'Chlorophyll_Smooth',
+    wTemp = 'Water_Temp_Smooth',
+    BOD = 'BOD_Smooth',
+    DTN = 'DTN_Smooth',
+    SPI6 = 'SPI6_Smooth'
+  )
+head(crane_covs)
+```
+
+# COLLINEARITY CHECKS (VIF & Correlation)
+```{r}
+library(car)
+library(corrplot)
+
+complete_covs <- crane_covs %>%
+  select(step, angle, Temp, Wind, wTemp, BOD, Chlor, DTN, SPI6) %>%
+  na.omit()
+
+cor_matrix <- cor(complete_covs %>% select(-step, -angle))
+#pdf(file = "/Users/yjkang/Desktop/corr_dynHMM.pdf")
+corrplot(cor_matrix, method = "color", type = "upper", tl.col = "black", addCoef.col = "black", number.cex = 1)
+#dev.off()
+
+dummy_lm <- lm(step ~ Temp + Wind + wTemp + BOD + Chlor + DTN + SPI6, data = complete_covs)
+print(car::vif(dummy_lm))
+```
+
+# STANDARDIZE THE COVARIATES
+```{r}
+# Reference mean and SD of every covariate, taken from the historical data the HMM is fitted to.
+# Any new covariates fed to this model (the SSP future series in 06, sensitivity runs) must be
+# standardised with THESE values, not with their own mean/SD. Re-scaling a future series on
+# itself would re-centre it to 0 and erase the projected shift (e.g. warming) before the HMM sees it.
+# These are the same centres/scales scale() used before, so the Z-scores and the fitted model are unchanged.
+cov_vars <- c("Temp", "Wind", "wTemp", "BOD", "Chlor", "DTN", "SPI6")
+scaling_ref <- crane_covs %>%
+  summarise(across(all_of(cov_vars),
+                   list(mu = ~ mean(., na.rm = TRUE), sd = ~ sd(., na.rm = TRUE))))
+print(scaling_ref)
+saveRDS(scaling_ref, "/Users/yjkang/Desktop/NIE_BigData/HMM_scaling_ref.rds")  # read by 06
+
+# Standardise a raw covariate with the stored historical reference
+z_ref <- function(x, var) (x - scaling_ref[[paste0(var, "_mu")]]) / scaling_ref[[paste0(var, "_sd")]]
+
+crane_covs <- crane_covs %>%
+  mutate(
+    Z_Temp     = z_ref(Temp,  "Temp"),
+    Z_Wind     = z_ref(Wind,  "Wind"),
+    Z_wTemp    = z_ref(wTemp, "wTemp"),
+    Z_BOD      = z_ref(BOD,   "BOD"),
+    Z_Chlor    = z_ref(Chlor, "Chlor"),
+    Z_DTN      = z_ref(DTN,   "DTN"),
+    Z_SPI6     = z_ref(SPI6,  "SPI6")
+  )
+
+library(momentuHMM)
+hmm_data <- crane_covs %>% ungroup() %>%
+  select(-step, -angle) %>% #drop old step and angle so prepData can calculate them afresh
+  filter(time >= as.POSIXct("2018-02-04", tz = "UTC")) %>%  #Filter out before the Cheorwon sensor came online. 2018-03-05
+  as.data.frame() %>%
+  prepData(type = "UTM", coordNames = c("x", "y"))
+class(hmm_data) #Should say "momentuHMMData" "data.frame"
+```
+
+# Mean Imputation
+```{r}
+#HMM cannot have NA for predictors (step,angle are okay), so Z-score mean 0 is imputed onto NA.
+#cannot simply erase the rows as it crashes the chronological step order of the chain.
+total_rows <- nrow(hmm_data)
+missing_stats <- data.frame(
+  Variable = c("Z_Temp", "Z_Wind", "Z_BOD", "Z_SPI6", "Z_wTemp", "Z_Chlor", "Z_DTN"),
+  Missing_Count = c(
+    sum(is.na(hmm_data$Z_Temp)), sum(is.na(hmm_data$Z_Wind)), #sum(is.na(hmm_data$Z_hPa)),
+    sum(is.na(hmm_data$Z_BOD)), sum(is.na(hmm_data$Z_SPI6)), sum(is.na(hmm_data$Z_wTemp)),
+    sum(is.na(hmm_data$Z_Chlor)), sum(is.na(hmm_data$Z_DTN))
+  )
+)
+missing_stats <- missing_stats %>%
+  mutate(
+    Percentage = round((Missing_Count / total_rows) * 100, 2)
+  )
+print(missing_stats)
+
+# Mean Imputation, replace predictor NA with z-score mean 0.
+hmm_data <- hmm_data %>%
+  mutate(
+    Z_Temp  = replace_na(Z_Temp, 0),
+    Z_Wind  = replace_na(Z_Wind, 0),
+    Z_BOD   = replace_na(Z_BOD, 0),
+    Z_wTemp = replace_na(Z_wTemp, 0),
+    Z_Chlor = replace_na(Z_Chlor, 0),
+    Z_DTN   = replace_na(Z_DTN, 0),
+    Z_SPI6  = replace_na(Z_SPI6, 0)
+  )
+#write_csv(hmm_data, "/Users/yjkang/Desktop/Hangang_covariates.csv")
+```
+
+# Merge back to the entire trajectory
+```{r}
+#climate variables are only attached to the Hangang region
+global_crane <- crane_data
+hangang_covs <- hmm_data
+
+#match timestamp
+global_crane <- global_crane %>%
+  mutate(time = as.POSIXct(time, format="%Y-%m-%d %H:%M", tz = "UTC"))
+hangang_covs <- hangang_covs %>%
+  mutate(time = as.POSIXct(time, format="%Y-%m-%d %H:%M", tz = "UTC")) %>%
+  select(ID, time, Station, Temp, Wind, wTemp, BOD, Chlor, DTN, SPI6,
+         Z_Temp, Z_Wind, Z_wTemp, Z_BOD, Z_Chlor, Z_DTN, Z_SPI6)
+
+# employ SPATIAL SWITCH to environment predictors for regions that are not Hangang
+master_global <- global_crane %>%
+  left_join(hangang_covs, by = c("ID", "time")) %>%
+  mutate(
+    # A. Create the Switch
+    In_Hangang = ifelse(!is.na(Station), 1, 0),
+    # B. Mean Imputation: Patch the millions of global NAs with 0. Switch will turn this off anyways.
+    Z_Temp  = replace_na(Z_Temp, 0),
+    Z_Wind  = replace_na(Z_Wind, 0),
+    Z_wTemp  = replace_na(Z_wTemp, 0),
+    Z_BOD   = replace_na(Z_BOD, 0),
+    Z_Chlor  = replace_na(Z_Chlor, 0),
+    Z_DTN  = replace_na(Z_DTN, 0),
+    Z_SPI6  = replace_na(Z_SPI6, 0),
+    # C. Multiply weather by the Switch
+    # Outside Korea: Weather * 0 = 0
+    # Inside Korea: Weather * 1 = Actual Hangang Z-Score
+    Han_Temp  = Z_Temp * In_Hangang,
+    Han_Wind  = Z_Wind * In_Hangang,
+    Han_wTemp = Z_wTemp  * In_Hangang,
+    Han_BOD   = Z_BOD  * In_Hangang,
+    Han_Chlor = Z_Chlor  * In_Hangang,
+    Han_DTN   = Z_DTN  * In_Hangang,
+    Han_SPI6  = Z_SPI6 * In_Hangang
+  )
+```
+
+```{r}
+br23018_11 <- master_global %>%
+  distinct(ID, time, .keep_all = TRUE) %>%
+  mutate(roundT = round_date(time, "30 min")) %>%
+  filter(minute(roundT) == 0 & ID=='br23018_11') %>%  #subsample every hour
+  select(-step, -angle) %>%
+  as.data.frame()
+pre_global_hmm <- master_global %>%
+  distinct(ID, time, .keep_all = TRUE) %>%
+  mutate(roundT = round_date(time, "30 min")) %>%
+  filter(minute(roundT) == 30 ) %>%  #subsample every 30 min
+  select(-step, -angle) %>%
+  as.data.frame()
+global_hmm_data <- rbind(pre_global_hmm, br23018_11) %>%
+  as.data.frame() %>%
+  prepData(type = "UTM", coordNames = c("x", "y"))
+```
+
+```{r}
+# Convert the newly calculated steps to kilometers and prevent zero-crashes!
+global_hmm_data$step <- global_hmm_data$step / 1000
+global_hmm_data$step[global_hmm_data$step == 0] <- 0.0001
+
+# Apply the mathematical artifact cleaner to neutralize "fake" steps
+is_interpolated <- c(FALSE, abs(diff(global_hmm_data$step)) < 1e-10)
+global_hmm_data$step[is_interpolated] <- NA
+global_hmm_data$angle[is_interpolated] <- NA
+
+hist(log(global_hmm_data$step), breaks = 100)
+hist(global_hmm_data$angle, breaks = 100)
+print(sum(global_hmm_data$step == 0, na.rm = TRUE))
+
+#write_csv(global_hmm_data, "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/04_Hangang_Crane_dynHMM/global_hmm_data_UTC.csv")
+```
+
+# run base HMM
+```{r}
+global_step_km <- c(45.0, 8.0, 0.02,   # Means: Migration (45km), Foraging (8km), Roosting (20m)
+                    10.0, 6.5, 0.01 )  # SDs
+
+global_angle <- c(0, pi, 0,         # Means: Migration 0 (straight), Foraging pi (turning back), Roosting 0
+                  8.0, 0.5, 0.1 )   # Concentrations: Migration 8.0 (highly directional), Foraging 0.5 (zigzagging), Roosting 0.1 (random/flat)
+
+# Fit without covariates to get base parameters of crane behaviour
+start_time <- Sys.time()
+model_base <- fitHMM(
+  #nlmPar = list(print.level = 2),  #print out gradients
+  data = global_hmm_data,
+  nbStates = 3,
+  dist = list(step = "gamma", angle = "vm"),
+  Par0 = list(step = global_step_km, angle = global_angle),
+  estAngleMean = list(angle = TRUE),
+  formula = ~ 1  # No covariates
+)
+end_time <- Sys.time()
+print(end_time - start_time)
+print(model_base, ask = FALSE)
+```
+
+```{r}
+#dynamic HMM for wintering subset in hangang region
+hangang_data <- global_hmm_data[global_hmm_data$In_Hangang == 1, ]
+
+#fix the parameters computed from the base model
+global_step_pars <- c(5.927842, 0.3972410, 0.04351320,   # Means: Traveling, Foraging, Roosting
+                      8.558490, 0.3196354, 0.04634466 )  # SDs
+
+global_angle_pars <- c(-0.004563477, 0.008767228, -0.008541543,         # Means
+                       0.755783352, 1.390751093,  0.691495849 )   # Concentrations
+
+start_time <- Sys.time()
+global_dynamic_model <- fitHMM(
+  #nlmPar = list(print.level = 2),
+  data = hangang_data,
+  nbStates = 3,
+  dist = list(step = "gamma", angle = "vm"),
+  Par0 = list(step = global_step_pars, angle = global_angle_pars),
+  estAngleMean = list(angle = TRUE),
+  fixPar = list(step = global_step_pars, angle = global_angle_pars),
+  formula = ~ Han_Temp +Han_Wind +Han_SPI6 +Han_wTemp +Han_BOD +Han_DTN +Han_Chlor
+)
+end_time <- Sys.time()
+print(end_time - start_time)
+print(global_dynamic_model, ask = FALSE)
+#CIbeta(global_dynamic_model)
+#saveRDS(global_dynamic_model, file = "/Users/yjkang/Desktop/NIE_BigData/Dyn_Crane_HMM_UTC.rds")
+```
+
+```{r}
+global_dynamic_model <- readRDS("/Users/yjkang/Desktop/NIE_BigData/Dyn_Crane_HMM_UTC.rds")
+```
+
+==============================================================================================================================
+
+# MULTIPLE INITIALISATION / CONVERGENCE CHECK
+```{r multistart check}
+# Step and angle parameters are fixed, so only the transition betas are estimated.
+# Refit from random beta starting values
+set.seed(2026)
+n_starts    <- 10
+ref_beta    <- global_dynamic_model$mle$beta
+ref_nllk    <- global_dynamic_model$mod$minimum      # negative log-likelihood of the reported fit
+dyn_formula <- ~ Han_Temp + Han_Wind + Han_SPI6 + Han_wTemp + Han_BOD + Han_DTN + Han_Chlor
+
+random_beta0 <- function() {
+  b <- ref_beta
+  b[] <- runif(length(b), -1, 1)                     # covariate effects (logit scale)
+  b["(Intercept)", ] <- runif(ncol(b), -5, 0)        # baseline switching rates
+  b
+}
+
+ms_fits <- lapply(seq_len(n_starts), function(s) {
+  t0  <- Sys.time()
+  fit <- tryCatch(fitHMM(
+      data = hangang_data, nbStates = 3,
+      dist = list(step = "gamma", angle = "vm"),
+      Par0 = list(step = global_step_pars, angle = global_angle_pars),
+      beta0 = random_beta0(),
+      estAngleMean = list(angle = TRUE),
+      fixPar = list(step = global_step_pars, angle = global_angle_pars),
+      formula = dyn_formula),
+    error = function(e) { message("Start ", s, ": ", conditionMessage(e)); NULL })
+  cat("Start", s, if (is.null(fit)) "- FAILED\n" else "- done\n")
+  list(fit = fit, mins = as.numeric(difftime(Sys.time(), t0, units = "mins")))
+})
+
+# One row per start: optimiser exit code (nlm: 1 or 2 = converged), smallest Hessian
+# eigenvalue (> 0 means a proper minimum), and distance of the betas from the reported model
+ms_tab <- do.call(rbind, lapply(seq_along(ms_fits), function(s) {
+  f <- ms_fits[[s]]$fit
+  if (is.null(f)) return(data.frame(Start = s, nllk = NA, code = NA, minEigen = NA,
+                                    maxAbsDiffBeta = NA, mins = ms_fits[[s]]$mins))
+  min_eig <- tryCatch(min(eigen(f$mod$hessian, symmetric = TRUE, only.values = TRUE)$values),
+                      error = function(e) NA)
+  data.frame(Start = s, nllk = f$mod$minimum, code = f$mod$code, minEigen = min_eig,
+             maxAbsDiffBeta = max(abs(f$mle$beta - ref_beta)), mins = ms_fits[[s]]$mins)
+}))
+best_nllk <- min(c(ms_tab$nllk, ref_nllk), na.rm = TRUE)
+ms_tab$dNllk <- ms_tab$nllk - best_nllk
+print(ms_tab)
+
+tol <- 1e-3   # log-likelihood units
+cat(sprintf("\nConverged (nlm code 1/2): %d of %d starts",
+            sum(ms_tab$code %in% c(1, 2)), n_starts))
+cat(sprintf("\nReached the best optimum (within %g): %d of %d starts",
+            tol, sum(ms_tab$dNllk < tol, na.rm = TRUE), n_starts))
+cat(sprintf("\nReported model vs best optimum: dNllk = %.4g %s\n", ref_nllk - best_nllk,
+            if (ref_nllk - best_nllk < tol) "(OK: reported model is at the best optimum)"
+            else "(WARNING: a better optimum was found - refit from that start)"))
+```
+
+```{r}
+# 10 further refits shifted by N(0, 0.2^2) noise on the logit scale.
+# this checks the convergence is stable, no flat or saddle convergence.
+set.seed(2027)
+n_perturb <- 10
+sd_beta   <- 0.2    # SD of logit-scale noise on transition betas
+
+# Draw all perturbed starts up front so they are reproducible and can be inspected
+pt_starts <- lapply(seq_len(n_perturb), function(s) {
+  b <- ref_beta
+  b[] <- ref_beta + rnorm(length(ref_beta), 0, sd_beta)
+  b
+})
+
+pt_fits <- lapply(seq_len(n_perturb), function(s) {
+  t0  <- Sys.time()
+  fit <- tryCatch(fitHMM(
+      data = hangang_data, nbStates = 3,
+      dist = list(step = "gamma", angle = "vm"),
+      Par0 = list(step = global_step_pars, angle = global_angle_pars),
+      beta0 = pt_starts[[s]],
+      estAngleMean = list(angle = TRUE),
+      fixPar = list(step = global_step_pars, angle = global_angle_pars),
+      formula = dyn_formula),
+    error = function(e) { message("Perturbed start ", s, ": ", conditionMessage(e)); NULL })
+  cat("Perturbed start", s, if (is.null(fit)) "- FAILED\n" else "- done\n")
+  list(fit = fit, mins = as.numeric(difftime(Sys.time(), t0, units = "mins")))
+})
+
+# Same summary columns as ms_tab, plus how far each start was moved from the reported betas
+pt_tab <- do.call(rbind, lapply(seq_along(pt_fits), function(s) {
+  f <- pt_fits[[s]]$fit
+  start_shift <- max(abs(pt_starts[[s]] - ref_beta))
+  if (is.null(f)) return(data.frame(Start = s, startShiftBeta = start_shift, nllk = NA, code = NA,
+                                    minEigen = NA, maxAbsDiffBeta = NA, mins = pt_fits[[s]]$mins))
+  min_eig <- tryCatch(min(eigen(f$mod$hessian, symmetric = TRUE, only.values = TRUE)$values),
+                      error = function(e) NA)
+  data.frame(Start = s, startShiftBeta = start_shift, nllk = f$mod$minimum, code = f$mod$code,
+             minEigen = min_eig, maxAbsDiffBeta = max(abs(f$mle$beta - ref_beta)),
+             mins = pt_fits[[s]]$mins)
+}))
+
+# Compare against the best optimum found by ANY run (reported fit, random starts, perturbed starts)
+best_nllk_all <- min(c(ref_nllk, ms_tab$nllk, pt_tab$nllk), na.rm = TRUE)
+pt_tab$dNllk  <- pt_tab$nllk - best_nllk_all
+print(pt_tab)
+
+at_best <- pt_tab$dNllk < tol & !is.na(pt_tab$dNllk)
+cat(sprintf("\nConverged (nlm code 1/2): %d of %d perturbed starts",
+            sum(pt_tab$code %in% c(1, 2)), n_perturb))
+cat(sprintf("\nReturned to the best optimum (within %g): %d of %d perturbed starts",
+            tol, sum(at_best), n_perturb))
+cat(sprintf("\nLargest beta difference from the reported model among those runs: %.3g",
+            if (any(at_best)) max(pt_tab$maxAbsDiffBeta[at_best]) else NA))
+cat(sprintf("\nReported model vs best optimum over all refits: dNllk = %.4g %s\n",
+            ref_nllk - best_nllk_all,
+            if (ref_nllk - best_nllk_all < tol) "(OK: reported model is at the best optimum)"
+            else "(WARNING: a better optimum was found - refit from that start)"))
+```
+
+==============================================================================================================================
+
+```{r}
+global_dynamic_model$data[] <- lapply(global_dynamic_model$data, function(x) {
+  if(is.numeric(x)) as.numeric(x) else x })
+environment(global_dynamic_model$conditions$formula) <- globalenv()
+
+baseline_conditions <- data.frame(
+  In_Hangang = 1,  # INSIDE Korea
+  Han_Temp   = 0,  # (The model will ignore this when plotting Temp)
+  Han_Wind   = 0,  # Average Wind
+  Han_wTemp  = 0,  # Average Water Temp
+  Han_BOD    = 0,  # Average BOD
+  Han_Chlor  = 0,  # Average Chlorophyll
+  Han_DTN    = 0,  # Average Nitrogen
+  Han_SPI6   = 0   # Average Drought condition
+)
+```
+
+```{r}
+predictors <- c( "Han_SPI6", "Han_Wind", "Han_Temp", "Han_wTemp", "Han_BOD", "Han_Chlor", "Han_DTN")
+#inside Hangang, averag everything else)
+baseline_list <- list(Han_Temp = 0, Han_Wind = 0, Han_wTemp = 0, Han_BOD = 0, Han_Chlor = 0, Han_DTN = 0, Han_SPI6 = 0)
+display_names <- c(
+  "Han_Temp"  = "Air Temperature",
+  "Han_Wind"  = "Wind Speed",
+  "Han_hPa"   = "Atmospheric Pressure",
+  "Han_wTemp" = "Water Temperature",
+  "Han_BOD"   = "BOD Levels",
+  "Han_Chlor" = "Chlorophyll-a",
+  "Han_DTN"   = "Total Nitrogen",
+  "Han_SPI6"  = "Drought (SPI6)" )
+```
+
+```{r, fig.height=3.8, fig.width=4, out.width="110%"}
+for (var in predictors) {
+  pretty_name <- display_names[var]
+  # The 100 steps across the X-axis
+  z_seq <- seq(-3, 3, length.out = 100)
+  plot_data <- data.frame()
+
+  for (z in z_seq) {
+    # Create a 1-row dataframe for this exact moment
+    current_covs <- as.data.frame(baseline_list)
+    current_covs[[var]] <- z
+    # Extract the math for this single row
+    ci_out <- CIreal(global_dynamic_model, covs = current_covs)
+    # Save all 9 transition combinations for this exact Z-score
+    for (from_state in 1:3) {
+      for (to_state in 1:3) {
+        temp_data <- data.frame(
+          Predictor_Value = z,
+          From = from_state,
+          To = to_state,
+          Transition = #paste0(from_state, "->", to_state),
+                        paste0(c("Travel", "Forage", "Roost")[from_state], " %->% ", c("Travel", "Forage", "Roost")[to_state]),
+          Estimate = ci_out$gamma$est[from_state, to_state],
+          Lower_CI = ci_out$gamma$lower[from_state, to_state],
+          Upper_CI = ci_out$gamma$upper[from_state, to_state]
+        )
+        plot_data <- rbind(plot_data, temp_data)
+      }
+    }
+  }
+  correct_order <- c("Travel %->% Travel", "Travel %->% Forage", "Travel %->% Roost",
+                      "Forage %->% Travel", "Forage %->% Forage", "Forage %->% Roost",
+                      "Roost %->% Travel", "Roost %->% Forage", "Roost %->% Roost" )
+  plot_data$Transition <- factor(plot_data$Transition, levels = correct_order)
+
+  p_var <- ggplot(plot_data, aes(x = Predictor_Value)) +
+    geom_ribbon(aes(ymin = Lower_CI, ymax = Upper_CI), fill = "gray40", alpha = 0.3) +
+    geom_line(aes(y = Estimate), color = "black", linewidth = 0.3) +
+    facet_wrap(~ Transition, scales = "fixed", ncol = 3, labeller = label_parsed) +
+    theme_bw(base_size = 9) +
+    labs(title = paste("Effect of", pretty_name, "on Transition Probability"),
+      subtitle = "holding all other variables at average value in Hangang",
+      x = paste(pretty_name, "(Z-Score)"),
+      y = "Probability") +
+    theme(strip.background = element_rect(fill = "gray90", color = NA), plot.margin = ggplot2::margin(t=10, r = 30, b = 10, l = 10),
+      strip.text = element_text(face = "bold", size = 8, hjust=0.5),
+      plot.title = element_text(size = 10.5, hjust=0.5), plot.subtitle = element_text(size = 8, hjust=0.5) )
+  print(p_var)
+  #ggsave(paste0("/Users/yjkang/Desktop/HMM_Transition_", var, ".pdf"), plot=p_var, height=3.8, width=4)
+}
+```
+
+```{r}
+global_hmm_data$State <- as.factor(viterbi(model_base))#global_dynamic_model))
+print(table(global_hmm_data$State))
+
+#Transforming UTM coordinates back to standard GPS Lat/Lon WGS84 (EPSG 4326))
+global_sf_utm <- st_as_sf(global_hmm_data, coords = c("x", "y"), crs = 32649, remove = FALSE)
+global_sf_ll <- st_transform(global_sf_utm, crs = 4326)
+coords_ll <- st_coordinates(global_sf_ll)
+global_hmm_data$lon <- coords_ll[, "X"]
+global_hmm_data$lat <- coords_ll[, "Y"]
+```
+
+```{r, fig.height=8, fig.width=16, out.width="100%"}
+p_id_map <- ggplot() +
+  geom_sf(data = master_boundary, fill = "gray95", color = "gray60", linewidth = 0.5) +
+  geom_path(data = global_hmm_data,
+            aes(x = lon, y = lat, group = ID),
+            color = "gray60", linewidth = 0.3, alpha = 0.6) +
+  geom_point(data = global_hmm_data,
+             aes(x = lon, y = lat, color = State),
+             size = 0.3, alpha = 0.8, shape=16) +
+  #coord_sf(crs = 4326)+
+  coord_sf(crs = 4326, xlim = c(126.25, 128.5), ylim = c(37.4, 38.75), expand = FALSE)+
+  facet_wrap(~ ID) +
+  theme_minimal() +
+  scale_color_manual(
+    values = c("1" = "darkblue", "2" = "red", "3" = "grey15"),
+    labels = c("Traveling", "Foraging", "Roosting") ) +
+  labs(title = "HMM decoded behavior states",
+    x = "", y = "", color = "Behavior State") +
+  theme(
+    strip.background = element_rect(fill = "gray90", color = NA),
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.major = element_line(color = "gray90", linetype = "dashed"),
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 7, angle = 45, hjust = 1) ) # Shrinks axis text so the grid isn't cluttered
+
+print(p_id_map)
+#ggsave("/Users/yjkang/Desktop/Crane_Trajectories_Grid.png", plot = p_id_map, width = 16, height = 8, dpi = 500)
+```
+
+```{r, fig.height=6, fig.width=8, out.width="100%"}
+target_crane <- global_hmm_data %>%
+  filter(ID == "27233947_36")
+
+p_single_crane <- ggplot() +
+  geom_sf(data = st_union(kor_muni,prk_prov), fill = "gray95", color = "gray60", linewidth = 0.2) +
+  geom_sf(data = master_boundary, fill = "darkgreen", alpha = 0.2, linewidth = 0) +
+  geom_path(data = target_crane,
+            aes(x = lon, y = lat),
+            color = "dodgerblue2", linewidth = 0.5, alpha = 0.6) +
+  geom_point(data = target_crane,
+             aes(x = lon, y = lat, color = State),
+             size = 0.7, alpha = 0.8, shape=16) +
+  coord_sf(crs = 4326, xlim = c(126.65, 126.75), ylim = c(37.9, 37.98), expand = FALSE)+
+  #coord_sf(crs = 4326, xlim = c(126.67, 126.8), ylim = c(37.6, 37.7), expand = FALSE)+
+  #coord_sf(crs = 4326, xlim = c(126.5, 127.5), ylim = c(37.6, 38.5), expand = FALSE)+
+  theme_minimal() +
+  scale_color_manual(
+    values = c("1" = "dodgerblue2", "2" = "red", "3" = "grey15"),
+    labels = c("Traveling", "Foraging", "Roosting") ) +
+  theme( axis.text.x = element_text(size = 7, angle = 45, hjust = 1) ) +
+  labs(x = "Longitude", y = "Latitude", color = "Behavior State")
+
+print(p_single_crane)
+```
+
+```{r, fig.height=6, fig.width=8, out.width="100%"}
+target_crane <- global_hmm_data %>%
+  filter(ID == "27233947_6")
+
+p_single_crane <- ggplot() +
+  geom_sf(data = st_union(kor_muni,prk_prov), fill = "gray95", color = "gray60", linewidth = 0.2) +
+  geom_sf(data = master_boundary, fill = "darkgreen", alpha = 0.2, linewidth = 0) +
+  geom_path(data = target_crane,
+            aes(x = lon, y = lat),
+            color = "dodgerblue2", linewidth = 0.5, alpha = 0.6) +
+  geom_point(data = target_crane,
+             aes(x = lon, y = lat, color = State),
+             size = 0.7, alpha = 0.8, shape=16) +
+  coord_sf(crs = 4326, xlim = c(126.66, 126.8), ylim = c(37.6, 37.7), expand = FALSE)+
+  #coord_sf(crs = 4326, xlim = c(126.5, 127.5), ylim = c(37.6, 38.5), expand = FALSE)+
+  theme_minimal() +
+  scale_color_manual(
+    values = c("1" = "dodgerblue2", "2" = "red", "3" = "grey15"),
+    labels = c("Traveling", "Foraging", "Roosting") ) +
+  theme( axis.text.x = element_text(size = 7, angle = 45, hjust = 1) ) +
+  labs(x = "Longitude", y = "Latitude", color = "Behavior State")
+
+print(p_single_crane)
+```
+
+```{r, fig.height=6, fig.width=8, out.width="100%"}
+target_crane <- global_hmm_data %>%
+  filter(ID == "br23018_2")
+
+p_single_crane <- ggplot() +
+  geom_sf(data = st_union(kor_muni,prk_prov), fill = "gray95", color = "gray60", linewidth = 0.2) +
+  geom_sf(data = master_boundary, fill = "darkgreen", alpha = 0.2, linewidth = 0) +
+  geom_path(data = target_crane,
+            aes(x = lon, y = lat),
+            color = "dodgerblue2", linewidth = 0.5, alpha = 0.6) +
+  geom_point(data = target_crane,
+             aes(x = lon, y = lat, color = State),
+             size = 0.7, alpha = 0.8, shape=16) +
+  coord_sf(crs = 4326, xlim = c(126.65, 126.75), ylim = c(37.9, 37.98), expand = FALSE)+
+  #coord_sf(crs = 4326, xlim = c(126.5, 127.5), ylim = c(37.6, 38.5), expand = FALSE)+
+  theme_minimal() +
+  scale_color_manual(
+    values = c("1" = "dodgerblue2", "2" = "red", "3" = "grey15"),
+    labels = c("Traveling", "Foraging", "Roosting") ) +
+  theme( axis.text.x = element_text(size = 7, angle = 45, hjust = 1) ) +
+  labs(x = "Longitude", y = "Latitude", color = "Behavior State")
+
+print(p_single_crane)
+```
+
+```{r, fig.height=6, fig.width=8, out.width="100%"}
+target_crane <- global_hmm_data %>%
+  filter(ID == "br22063_1")
+
+p_single_crane <- ggplot() +
+  geom_sf(data = st_union(kor_muni,prk_prov), fill = "gray95", color = "gray60", linewidth = 0.2) +
+  geom_sf(data = master_boundary, fill = "darkgreen", alpha = 0.2, linewidth = 0) +
+  geom_path(data = target_crane,
+            aes(x = lon, y = lat),
+            color = "dodgerblue2", linewidth = 0.5, alpha = 0.6) +
+  geom_point(data = target_crane,
+             aes(x = lon, y = lat, color = State),
+             size = 0.7, alpha = 0.8, shape=16) +
+  coord_sf(crs = 4326, xlim = c(126.65, 126.75), ylim = c(37.9, 37.98), expand = FALSE)+
+  #coord_sf(crs = 4326, xlim = c(126.5, 127.5), ylim = c(37.6, 38.5), expand = FALSE)+
+  theme_minimal() +
+  scale_color_manual(
+    values = c("1" = "dodgerblue2", "2" = "red", "3" = "grey15"),
+    labels = c("Traveling", "Foraging", "Roosting") ) +
+  theme( axis.text.x = element_text(size = 7, angle = 45, hjust = 1) ) +
+  labs(x = "Longitude", y = "Latitude", color = "Behavior State")
+
+print(p_single_crane)
+```
+
+```{r, fig.height=5, fig.width=8, out.width="100%"}
+library(rnaturalearth)
+basemap <- ne_countries(scale = "medium", returnclass = "sf")
+
+p_main <- ggplot() +
+  geom_sf(data = basemap, fill = "gray95", color = "gray60", linewidth = 0.2) +
+  geom_sf(data = master_boundary, fill = "darkgreen", alpha = 0.2, linewidth = 0) +
+  geom_path(data = target_crane,
+            aes(x = lon, y = lat),
+            color = "dodgerblue2", linewidth = 0.5, alpha = 0.3) +
+  geom_point(data = target_crane,
+             aes(x = lon, y = lat, color = State),
+             size = 0.5, alpha = 0.5, shape=16) +
+  coord_sf(crs = 4326, xlim = c(110, 135), ylim = c(48, 33), expand = FALSE) + #xlim = c(118, 131)
+  # DRAW THE ZOOM BOX: This draws a red box to show the reader the inset area
+  annotate("rect", xmin = 126.62-0.2, xmax = 127.41+0.1, ymin = 37.88-0.1, ymax = 38.38+0.1,
+           color = "black", fill = NA, linewidth = 0.7) +
+  theme_minimal() +
+  theme(legend.position = c(0.1,0.75), legend.text=element_text(size=11, face="bold"), legend.title=element_blank()) +
+  scale_color_manual(
+    values = c("1" = "dodgerblue2", "2" = "red", "3" = "grey15"),
+    labels = c("Travel", "Forage", "Roost") ) +
+  labs(x = "Longitude", y = "Latitude", color = "Behavior State")
+
+p_inset <- ggplot() +
+  geom_sf(data = st_union(kor_muni, prk_prov), fill = "gray95", color = "gray60", linewidth = 0.2) +
+  geom_sf(data = master_boundary, fill = "darkgreen", alpha = 0.2, linewidth = 0) +
+  geom_path(data = target_crane,
+            aes(x = lon, y = lat),
+            color = "dodgerblue2", linewidth = 0.3, alpha = 0.5) +
+  geom_point(data = target_crane,
+             aes(x = lon, y = lat, color = State),
+             size = 0.2, alpha = 0.7, shape=16) +
+  coord_sf(crs = 4326, xlim = c(126.62, 127.41), ylim = c(37.88, 38.38), expand = FALSE) +
+  scale_color_manual(values = c("1" = "dodgerblue2", "2" = "red", "3" = "grey15")) +
+  theme_bw() +
+  theme(plot.margin = ggplot2::margin(t = 0, r = 0, b = 0, l = 0, "pt"),
+    legend.position = "none",          # Hide legend in the small box
+    axis.title = element_blank(),      # Hide "Longitude/Latitude" text
+    axis.text = element_blank(), axis.ticks.length = unit(0, "pt"),
+    panel.border = element_rect(color = "black", linewidth = 1.5) # Wrap inset in a red border to match the box
+  )
+
+library(patchwork)
+p_combined <- p_main + inset_element(p_inset, left = 0.05, bottom = 0.05, right = 0.45, top = 0.45)
+print(p_combined)
+#ggsave("/Users/yjkang/Desktop/CraneTraj_HMM_inset.pdf", plot=p_combined, height = 5, width = 8)
+```
+
+==============================================================================================================================
+Demonstrate the results are robust to the original temporal resolution of covariates (no interpolation).
+```{r}
+# ==========================================
+# SENSITIVITY: native-resolution covariates, no spline
+# ==========================================
+spline_vars <- c("wTemp", "BOD", "Chlor", "DTN")
+han_names   <- c(wTemp = "Han_wTemp", BOD = "Han_BOD", Chlor = "Han_Chlor", DTN = "Han_DTN", SPI6 = "Han_SPI6")
+
+# Start from the SAME rows used by the main model
+hangang_monthly <- hangang_data
+
+# --- Water quality: monthly record per station ---
+water_monthly <- water_chem %>%
+  mutate(Date  = as.Date(Date, format = "%Y.%m.%d"),
+         Month = format(Date, "%Y-%m")) %>%
+  group_by(Station, Month) %>%
+  summarise(wTemp = mean(Water_Temperature, na.rm = TRUE),
+            BOD   = mean(BOD,               na.rm = TRUE),
+            Chlor = mean(Chlorophyll,       na.rm = TRUE),
+            DTN   = mean(DTN,               na.rm = TRUE), .groups = "drop")
+
+env_monthly <- water_monthly %>%
+  mutate(across(all_of(spline_vars), ~ ifelse(is.nan(.), NA, .)))   # all-NA months give NaN
+
+# Months and days are defined in KST, because the sampling dates are local
+gps_month <- format(with_tz(hangang_monthly$time, "Asia/Seoul"), "%Y-%m")
+idx <- match(paste(hangang_monthly$Station, gps_month),
+             paste(env_monthly$Station, env_monthly$Month))
+
+for (v in spline_vars) {
+  z <- z_ref(env_monthly[[v]][idx], v)   # same historical reference as the main model
+  cat(sprintf("%-6s %5.1f%% of fixes with no monthly record -> imputed 0\n",
+              v, 100 * mean(is.na(z))))
+  z[is.na(z)] <- 0
+  hangang_monthly[[han_names[[v]]]] <- z
+}
+
+# --- SPI6: daily value per station ---
+drought_daily <- drought %>%
+  mutate(Day = format(as.Date(Date_Time), "%Y-%m-%d")) %>%
+  select(Station, Day, SPI6)
+
+gps_day <- format(with_tz(hangang_monthly$time, "Asia/Seoul"), "%Y-%m-%d")
+idx_d   <- match(paste(hangang_monthly$Station, gps_day),
+                 paste(drought_daily$Station, drought_daily$Day))
+
+z <- z_ref(drought_daily$SPI6[idx_d], "SPI6")
+cat(sprintf("SPI6   %5.1f%% of fixes with no daily record -> imputed 0\n", 100 * mean(is.na(z))))
+z[is.na(z)] <- 0
+hangang_monthly$Han_SPI6 <- z
+```
+
+Check collinearity again and refit
+```{r}
+mon_covs <- as.data.frame(hangang_monthly)[, c("step", "Han_Temp", "Han_Wind", "Han_wTemp",
+                                               "Han_BOD", "Han_Chlor", "Han_DTN", "Han_SPI6")]
+print(round(cor(mon_covs[, -1]), 2))
+print(car::vif(lm(step ~ ., data = mon_covs)))
+
+monthly_model <- fitHMM(
+  data = hangang_monthly,
+  nbStates = 3,
+  dist = list(step = "gamma", angle = "vm"),
+  Par0 = list(step = global_step_pars, angle = global_angle_pars),
+  beta0 = global_dynamic_model$mle$beta,          # warm start
+  estAngleMean = list(angle = TRUE),
+  fixPar = list(step = global_step_pars, angle = global_angle_pars),
+  formula = ~ Han_Temp + Han_Wind + Han_SPI6 + Han_wTemp + Han_BOD + Han_DTN + Han_Chlor
+)
+monthly_model$data[] <- lapply(monthly_model$data, function(x) if (is.numeric(x)) as.numeric(x) else x)
+environment(monthly_model$conditions$formula) <- globalenv()
+```
+
+```{r}
+#AIC(global_dynamic_model, monthly_model)   # same rows, same no. of parameters, so comparable
+
+# Comparison is valid only if the response and rows are identical; check explicitly
+stopifnot(identical(global_dynamic_model$data$ID,    monthly_model$data$ID),
+          identical(global_dynamic_model$data$step,  monthly_model$data$step),
+          identical(global_dynamic_model$data$angle, monthly_model$data$angle))
+
+# n for BIC: time steps with at least one observed data stream
+n_obs <- with(global_dynamic_model$data, sum(!is.na(step) | !is.na(angle)))
+
+ic_row <- function(model, label) {
+  aic <- AIC(model)                  # package's own count of free parameters
+  ll  <- -model$mod$minimum          # maximised log-likelihood
+  k   <- round((aic + 2 * ll) / 2)   # recover k from AIC = -2*logLik + 2k
+  data.frame(Model = label, logLik = ll, k = k, n = n_obs,
+             AIC = aic, BIC = -2 * ll + log(n_obs) * k)
+}
+
+ic_tab <- rbind(ic_row(global_dynamic_model, "Interpolated"),
+                ic_row(monthly_model,        "Original")) %>%
+  mutate(dAIC = AIC - min(AIC),
+         dBIC = BIC - min(BIC))
+print(ic_tab)
+```
+
+Compare coefficients
+```{r}
+beta_long <- function(model, label) {
+  ci <- CIbeta(model)$beta
+  data.frame(Model      = label,
+             Covariate  = rep(rownames(ci$est), times = ncol(ci$est)),
+             Transition = rep(colnames(ci$est), each  = nrow(ci$est)),
+             Est   = as.vector(ci$est),
+             Lower = as.vector(ci$lower),
+             Upper = as.vector(ci$upper))
+}
+
+beta_cmp <- rbind(beta_long(global_dynamic_model, "Interpolated"),
+                  beta_long(monthly_model,        "Original")) %>%
+  filter(Covariate != "(Intercept)") %>%
+  mutate(Model = factor(Model, levels = c("Interpolated", "Original")))
+
+robust_tab <- beta_cmp %>%
+  pivot_wider(id_cols = c(Covariate, Transition), names_from = Model,
+              values_from = c(Est, Lower, Upper)) %>%
+  mutate(Same_sign        = sign(Est_Interpolated) == sign(Est_Original),
+         Sig_Interpolated = Lower_Interpolated > 0 | Upper_Interpolated < 0,
+         Sig_Original     = Lower_Original     > 0 | Upper_Original     < 0,
+         CI_overlap       = Lower_Original <= Upper_Interpolated &
+                            Lower_Interpolated <= Upper_Original)
+print(robust_tab, n = Inf, width = Inf)
+
+p_forest <- ggplot(beta_cmp, aes(x = Est, y = Covariate, colour = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray50") +
+  geom_pointrange(aes(xmin = Lower, xmax = Upper),
+                  position = position_dodge(width = 0.5), size = 0.2) +
+  facet_wrap(~ Transition, ncol = 3) +
+  scale_colour_manual(values = c(Interpolated = "black", Original = "firebrick")) +
+  theme_bw(base_size = 9) +
+  labs(x = "Beta (logit scale)", y = "", colour = "")
+print(p_forest)
+#ggsave("/Users/yjkang/Desktop/interpolation_check.pdf", plot = p_forest)
+```
+
+Overlay transition-probability curves
+```{r}
+trans_curve <- function(model, var, label) {
+  st <- c("Travel", "Forage", "Roost")
+  do.call(rbind, lapply(seq(-3, 3, length.out = 100), function(z) {
+    covs <- as.data.frame(baseline_list); covs[[var]] <- z
+    g <- CIreal(model, covs = covs)$gamma
+    data.frame(Model = label, Predictor_Value = z,
+               Transition = paste0(rep(st, times = 3), " %->% ", rep(st, each = 3)),
+               Estimate = as.vector(g$est), Lower_CI = as.vector(g$lower), Upper_CI = as.vector(g$upper))
+  }))
+}
+
+for (var in han_names) {
+  pd <- rbind(trans_curve(global_dynamic_model, var, "Interpolated"),
+              trans_curve(monthly_model,        var, "Original"))
+  pd$Transition <- factor(pd$Transition, levels = correct_order)
+  p <- ggplot(pd, aes(Predictor_Value, Estimate, colour = Model, fill = Model)) +
+    geom_ribbon(aes(ymin = Lower_CI, ymax = Upper_CI), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 0.4) +
+    facet_wrap(~ Transition, ncol = 3, labeller = label_parsed) +
+    scale_colour_manual(values = c(Interpolated = "black", Original = "firebrick")) +
+    scale_fill_manual(values   = c(Interpolated = "black", Original = "firebrick")) +
+    theme_bw(base_size = 9) +
+    labs(title = paste("Sensitivity:", display_names[var]),
+         x = paste(display_names[var], "(Z-Score)"), y = "Probability", colour = "", fill = "")
+  print(p)
+}
+```
+
+==============================================================================================================================
+Check if model is not driven by particular individual.
+```{r}
+loio <- lapply(unique_birds, function(b) {
+  d <- hangang_data[hangang_data$Base_Bird_ID != b, ]
+  class(d) <- c("momentuHMMData", "data.frame")
+  fit <- tryCatch(fitHMM(
+      data = d, nbStates = 3,
+      dist = list(step = "gamma", angle = "vm"),
+      Par0 = list(step = global_step_pars, angle = global_angle_pars),
+      beta0 = global_dynamic_model$mle$beta,
+      estAngleMean = list(angle = TRUE),
+      fixPar = list(step = global_step_pars, angle = global_angle_pars),
+      formula = ~ Han_Temp + Han_Wind + Han_SPI6 + Han_wTemp + Han_BOD + Han_DTN + Han_Chlor),
+    error = function(e) NULL)
+  cat("Dropped", b, if (is.null(fit)) "- FAILED\n" else "\n")
+  if (is.null(fit)) return(NULL)
+  beta_long(fit, b) %>% rename(Dropped = Model)
+})
+loio_df <- bind_rows(loio) %>% filter(Covariate != "(Intercept)")
+
+full <- beta_long(global_dynamic_model, "Full") %>%
+  filter(Covariate != "(Intercept)") %>%
+  transmute(Covariate, Transition, Est_full = Est, Sig_full = Lower > 0 | Upper < 0)
+```
+
+```{r}
+loio_sum <- loio_df %>%
+  left_join(full, by = c("Covariate", "Transition")) %>%
+  mutate(Sig = Lower > 0 | Upper < 0,
+         Flip = sign(Est) != sign(Est_full)) %>%
+  group_by(Covariate, Transition) %>%
+  summarise(Est_full   = first(Est_full),
+            Sig_full   = first(Sig_full),
+            LOIO_min   = min(Est), LOIO_max = max(Est),
+            n_flip     = sum(Flip),
+            most_infl  = Dropped[which.max(abs(Est - Est_full))],
+            .groups = "drop")
+print(loio_sum %>% filter(Sig_full), n = Inf, width = Inf)   # focus on reported effects
+```
+
+```{r}
+p_loio <- ggplot(loio_df, aes(x = Est, y = Covariate)) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "gray50") +
+  geom_point(colour = "gray40", size = 1.2, alpha = 0.6, shape = 16) +
+  geom_point(data = full, aes(x = Est_full), colour = "firebrick", shape = 4, size = 2) +
+  facet_wrap(~ Transition, ncol = 3) +
+  theme_bw(base_size = 9) +
+  labs(x = "Beta (logit scale)", y = "",
+       title = "Leave-one-individual-out estimates (grey) vs full model (red)")
+print(p_loio)
+#ggsave("/Users/yjkang/Desktop/leav-one-out.pdf", plot = p_loio)
+```
+
+
+
+

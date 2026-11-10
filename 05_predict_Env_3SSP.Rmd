@@ -1,0 +1,865 @@
+---
+title: "BigData_Wetland_migratoryBirds: future environment from raw SSP values"
+author: "Youn Jae Kang"
+date: "2026-10-15"
+output: html_document
+---
+
+Projects daily air temperature, wind speed, SPI6, water temperature, BOD, DTN and
+chlorophyll-a for the winters (Oct-Apr) of 2031-2050 under SSP2-4.5, at the Hangang
+stations Paju and Cheorwon.
+
+1. **Water-quality models.** On the actual sampling dates (Oct-Apr), one linear regression
+   per variable on that day's observed station climate:
+   - water temperature ~ station + K-day mean air temperature
+   - log(1 + BOD / DTN / Chl-a) ~ station + K-day mean air temperature + K-day mean wind
+     + SPI6 + seasonal cycle (sin/cos of day of year)
+2. **Running-mean window.** Candidate windows are compared by leave-one-winter-out error.
+   Performance was nearly identical across windows, so K is fixed at 7 days (one K shared
+   by all variables).
+3. **Validation.** Leave-one-winter-out with the chosen K. RMSE, MAE and R² per variable,
+   in original units.
+4. **Future climate.** The SSP2-4.5 values of the grid cell nearest each station. Air temperature
+   and wind are daily; SPI6 is monthly in the SSP file, so each day takes its month's value.
+5. **Future water quality.** The models predict each future day from that day's SSP
+   climate.
+6. **Output.** Native resolution (daily file + monthly SPI6 file), plus the existing daily
+   and 30-min interpolation files used by script 06.
+7. **Historical vs. future.** Historical = HMM covariates when cranes were in the Hangang
+   (`In_Hangang == 1`), as daily means. Future = 2031-2050 values on the same calendar days.
+
+```{r packages, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(ncdf4)
+library(effectsize)
+```
+
+```{r settings}
+stations      <- c("Paju", "Cheorwon")
+station_xy    <- tibble(Station = stations, lon = c(126.79618, 127.3113), lat = c(37.76469, 38.1485))
+WINTER_MONTHS <- c(10, 11, 12, 1, 2, 3, 4)
+K_CANDIDATES  <- c(1, 3, 5, 7, 10, 14, 21, 30)   # running-mean windows compared in section 3
+K_OVERRIDE    <- 7                               # window used; NULL = use the window selected in section 3
+FUT_YEARS     <- 2031:2070
+
+# Time conventions (same as 04 and 06):
+TZ_LOCAL   <- "Asia/Seoul"
+ANCHOR_KST <- "12:00:00" # a daily value is anchored at 12:00 KST of its day (= 03:00 UTC), as in 04.
+SPI6_DAY   <- "first"    # day of its month each monthly SPI6 value is placed on: "first" or "last"
+
+paths <- list(
+  water_chem    = "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/water_Chem_paju_cheorwon_2016_2024.csv",
+  clim_paju     = "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/hourly_climate/paju_climate_2014_2024.csv",
+  clim_cheorwon = "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/hourly_climate/cheorwon_climate_2014_2024.csv",
+  spi6_obs      = "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/한강습지/env_variable/daily_drought/cheorwon_paju_spi6_2016_2024.csv",
+  hmm_data      = "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/global_hmm_data.csv",
+  nc_grid       = "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/Wetland_2006_2023/Korea_2000_2019_yearly_climate/평균기온_MKPRISMv21_skorea_TA_gridraw_yearly_2000_2019.nc",
+  temp_folder   = "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/realistic/temperature_SSP245_2031_2070_asc",
+  temp_prefix   = "AR6_SSP245_5ENSMN_skorea_TA_gridraw_daily_",   # + <year>.txt
+  wind_folder   = "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/realistic/windspeed_SSP245_2031_2070_asc",
+  wind_prefix   = "AR6_SSP245_5ENSMN_skorea_WS_gridraw_daily_",   # + <year>.txt
+  spi6_file     = "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP/realistic/SPI6_SSP245_monthly_2021_2100_asc/AR6_SSP245_5ENSMN_skorea_SPI6_gridraw_monthly_2021_2100.txt",
+  spi6_start    = "2021-01-01",                                    # first month in the SPI6 file
+  out_dir       = "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability"
+)
+paths$supp_dir <- file.path(paths$out_dir, "supp05_predict_env")
+dir.create(paths$supp_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Winter label: Oct-Dec 2020 and Jan-Apr 2021 both belong to winter 2020
+season_year <- function(d) ifelse(month(d) >= 5, year(d), year(d) - 1)
+
+# Mean of the last k days (including the day itself)
+run_mean <- function(x, k) {
+  m <- rollapplyr(x, k, mean, na.rm = TRUE, partial = TRUE)
+  m[!is.finite(m)] <- NA
+  m
+}
+
+# Adds k-day running means of air temperature and wind, per station
+add_running <- function(d, k) {
+  d %>%
+    group_by(Station) %>%
+    arrange(Date, .by_group = TRUE) %>%
+    mutate(Temp_k = run_mean(Temp, k), Wind_k = run_mean(Wind, k)) %>%
+    ungroup()
+}
+
+var_levels <- c("Temp", "Wind", "SPI6", "wTemp", "BOD", "DTN", "Chlor")
+
+# Anchor time (UTC) of a daily value: 12:00 KST of its day
+anchor_utc <- function(d) with_tz(as.POSIXct(paste(d, ANCHOR_KST), tz = TZ_LOCAL), "UTC")
+
+# Day of its month that a monthly SPI6 value is placed on
+spi6_day <- function(month_start) {
+  if (SPI6_DAY == "first") return(month_start)
+  d <- (month_start %m+% months(1)) - days(1)
+  if_else(format(d, "%m-%d") == "02-29", d - days(1), d)   # SSP daily files have no 29 Feb
+}
+```
+
+## 1. Observed daily data
+
+```{r observed}
+# Hourly station climate -> daily means
+clim <- bind_rows(read.csv(paths$clim_paju), read.csv(paths$clim_cheorwon)) %>%
+  mutate(Date = as.Date(as.POSIXct(Date_Time, format = "%Y-%m-%d %H:%M", tz = "Asia/Seoul"),
+                        tz = "Asia/Seoul")) %>%
+  filter(!is.na(Date)) %>%
+  group_by(Station, Date) %>%
+  summarise(Temp = mean(Temperature.C., na.rm = TRUE),
+            Wind = mean(Wind_Speed.m.s., na.rm = TRUE), .groups = "drop")
+
+spi <- read.csv(paths$spi6_obs) %>%
+  mutate(Date = as.Date(Date_Time)) %>%
+  group_by(Station, Date) %>%
+  summarise(SPI6 = mean(SPI6, na.rm = TRUE), .groups = "drop")
+
+# Complete daily series per station (running means are added once K is known)
+daily_obs <- full_join(clim, spi, by = c("Station", "Date")) %>%
+  mutate(across(c(Temp, Wind, SPI6), ~ ifelse(is.finite(.x), .x, NA))) %>%
+  group_by(Station) %>%
+  complete(Date = seq(min(Date), max(Date), by = "day")) %>%
+  arrange(Date, .by_group = TRUE) %>%
+  ungroup()
+
+# Water-quality samples (Oct-Apr)
+wq_samples <- read.csv(paths$water_chem) %>%
+  transmute(Station, Date = as.Date(Date, format = "%Y.%m.%d"),
+            wTemp = Water_Temperature, BOD, DTN, Chlor = Chlorophyll) %>%
+  group_by(Station, Date) %>%
+  summarise(across(everything(), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  filter(month(Date) %in% WINTER_MONTHS) %>%
+  mutate(Winter = season_year(Date), doy = yday(Date))
+
+# Samples with the climate of the sampling day, for a k-day running mean
+wq_for_k <- function(k) {
+  wq_samples %>%
+    left_join(add_running(daily_obs, k), by = c("Station", "Date")) %>%
+    mutate(Station = factor(Station, levels = stations))
+}
+
+# Supplementary: water-quality samples available for the models (Oct-Apr)
+sample_summary <- wq_samples %>%
+  pivot_longer(c(wTemp, BOD, DTN, Chlor), names_to = "Variable", values_to = "Value") %>%
+  filter(!is.na(Value)) %>%
+  group_by(Variable, Station) %>%
+  summarise(n_samples = n(), n_winters = n_distinct(Winter),
+            first = min(Date), last = max(Date),
+            mean = mean(Value), sd = sd(Value), min = min(Value), max = max(Value), .groups = "drop")
+print(sample_summary)
+```
+
+## 2. Water-quality models
+
+For water temp:
+wTemp = b₀ + b_station + b₁·Temp_k
+
+For BOD/DTN/CHl-a:
+log(1 + BOD) = b₀ + b_station + b₁·Temp_k + b₂·Wind_k + b₃·SPI6 + b₄·sin(2π·doy/365) + b₅·cos(2π·doy/365)
+
+1. Takes that day’s SSP air temperature and wind at the grid cell nearest the station.
+2. Computes the 7-day means ending that day (Temp_k, Wind_k).
+3. Looks up that month’s SPI6 and the day of year.
+4. Plugs these into the equation to get log(1 + BOD).
+5. Back-transforms with exp(·) × Duan’s smearing factor − 1, and floors the result at 0.
+
+```{r models}
+models <- list(
+  wTemp = wTemp ~ Station + Temp_k,
+  BOD   = log1p(BOD)   ~ Station + Temp_k + Wind_k + SPI6 + sin(2*pi*doy/365) + cos(2*pi*doy/365),
+  DTN   = log1p(DTN)   ~ Station + Temp_k + Wind_k + SPI6 + sin(2*pi*doy/365) + cos(2*pi*doy/365),
+  Chlor = log1p(Chlor) ~ Station + Temp_k + Wind_k + SPI6 + sin(2*pi*doy/365) + cos(2*pi*doy/365)
+)
+log_vars <- c("BOD", "DTN", "Chlor")
+
+# Model variables present in a data set
+model_vars <- function(v, data) intersect(all.vars(models[[v]]), names(data))
+
+# Samples with the response and every predictor present
+model_data <- function(v, data = wq) {
+  data %>% filter(if_all(all_of(model_vars(v, data)), ~ !is.na(.x)))
+}
+
+fit_model <- function(v, data) {
+  m <- lm(models[[v]], data = data)
+  # Smearing factor: back-transforming a log-scale mean otherwise underestimates the mean
+  m$smear <- if (v %in% log_vars) mean(exp(residuals(m))) else 1
+  m
+}
+
+# Predictions in original units, never below 0
+predict_model <- function(m, v, newdata) {
+  p <- predict(m, newdata = newdata)
+  if (v %in% log_vars) p <- exp(p) * m$smear - 1
+  pmax(p, 0)
+}
+
+# Leave-one-winter-out predictions for variable v on data d
+loyo <- function(v, d = model_data(v)) {
+  bind_rows(lapply(sort(unique(d$Winter)), function(w) {
+    m    <- fit_model(v, filter(d, Winter != w))
+    test <- filter(d, Winter == w)
+    tibble(Station = as.character(test$Station), Date = test$Date, Winter = w,
+           obs = test[[v]], pred = predict_model(m, v, test))
+  }))
+}
+
+scores <- function(obs, pred) tibble(
+  n    = length(obs),
+  RMSE = sqrt(mean((obs - pred)^2)),
+  MAE  = mean(abs(obs - pred)),
+  R2   = 1 - sum((obs - pred)^2) / sum((obs - mean(obs))^2)
+)
+```
+
+## 3. Choosing the running-mean window K
+Each candidate K is scored by leave-one-winter-out prediction error. 
+
+```{r window selection}
+wq_by_k <- lapply(setNames(K_CANDIDATES, K_CANDIDATES), wq_for_k)
+
+# Same samples for every window
+common_data <- function(v, k) {
+  keep <- Reduce(`&`, lapply(wq_by_k, function(d) complete.cases(d[, model_vars(v, d)])))
+  wq_by_k[[as.character(k)]][keep, ]
+}
+
+k_overall <- k_cv %>%
+  group_by(K) %>%
+  summarise(mean_nRMSE = mean(nRMSE), mean_R2 = mean(R2), .groups = "drop")
+K_best <- k_overall$K[which.min(k_overall$mean_nRMSE)]
+K      <- if (is.null(K_OVERRIDE)) K_best else K_OVERRIDE
+print(k_overall)
+
+# Data used from here on
+wq <- wq_for_k(K)
+```
+Out-of-sample performance was largely insensitive to the window: across 1-30 days, mean
+RMSE varied only between 0.68 and 0.69 (mean R² 0.49-0.51). 
+K is therefore fixed at 7 days (`K_OVERRIDE`), which scored within 0.01 of
+the best window and relies less on day-to-day variability that the SSP ensemble mean smooths.
+
+## 4. Leave-one-winter-out validation
+
+There are 10 winters (2015–2024). For each winter, the script:
+1. Removes all samples from that winter.
+2. Fits each model on the remaining 9 winters.
+3. Predicts the removed winter’s samples and stores them next to the observed values.
+
+```{r validation}
+cv_pred <- bind_rows(lapply(names(models), function(v) loyo(v) %>% mutate(Variable = v, .before = 1)))
+
+# Supplementary: out-of-sample scores, both stations pooled and per station
+cv_scores <- bind_rows(
+  cv_pred %>% group_by(Variable) %>% summarise(scores(obs, pred)) %>% mutate(Station = "Both"),
+  cv_pred %>% group_by(Variable, Station) %>% summarise(scores(obs, pred), .groups = "drop")
+) %>%
+  relocate(Variable, Station) %>%
+  arrange(match(Variable, var_levels), Station != "Both", Station)
+print(cv_scores)
+write_csv(cv_scores, file.path(paths$supp_dir, "S2_LOYO_scores.csv"))
+write_csv(cv_pred,   file.path(paths$supp_dir, "S2_LOYO_predictions.csv"))
+```
+
+RMSE and MAE are in the units of each variable (°C, mg/L, mg/L, ug/L). 
+R² is out-of-sample (1 - SSE / SST on the held-out samples), so it can be negative.
+
+```{r, fig.width=8, fig.height=2.6}
+# Supplementary figure: observed vs. held-out predictions, 1:1 line
+p_cv <- ggplot(cv_pred, aes(obs, pred, color = Station)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  geom_point(size = 1, alpha = 0.7, shape = 16) +
+  facet_wrap(~ factor(Variable, levels = var_levels), scales = "free", nrow = 1) +
+  theme_bw() +
+  labs(x = "Observed", y = "Predicted (held-out winter)", color = NULL) +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+print(p_cv)
+ggsave(file.path(paths$supp_dir, "S2_LOYO_obs_vs_pred.pdf"), p_cv, width = 8, height = 2.6)
+```
+
+```{r final models}
+# Final models, fitted on all winters (no LOWO)
+final <- lapply(setNames(names(models), names(models)), function(v) fit_model(v, model_data(v)))
+
+# Supplementary: coefficients and in-sample fit of the final models
+coef_table <- bind_rows(lapply(names(final), function(v) {
+  cf <- summary(final[[v]])$coefficients
+  tibble(Variable = v, Scale = ifelse(v %in% log_vars, "log(1 + y)", "original"),
+         Term = rownames(cf), Estimate = cf[, 1], SE = cf[, 2], t = cf[, 3], p = cf[, 4])
+}))
+fit_table <- tibble(Variable    = names(final),
+                    n           = sapply(final, nobs),
+                    R2_in       = sapply(final, function(m) summary(m)$r.squared),
+                    Residual_SE = sapply(final, sigma))
+print(coef_table, n = Inf)
+print(fit_table)
+write_csv(coef_table, file.path(paths$supp_dir, "S3_model_coefficients.csv"))
+write_csv(fit_table,  file.path(paths$supp_dir, "S3_model_fit.csv"))
+```
+
+## 5. Future climate (raw SSP values) and water quality
+1. Locate each station on the SSP grid.
+2. Read the raw SSP climate for those two cells.
+3. Build the daily predictor table
+4. Predict water quality. The final models were fitted on all observed winters. They are applied to each future day:
+- Water temperature is linear in station and Temp_k.
+- BOD, DTN and Chl-a are predicted on the log(1+y) scale from station, Temp_k, Wind_k, SPI6 and the sin/cos seasonal terms. They are back-transformed as exp(·) × Duan’s smearing factor − 1 and floored at 0.
+
+```{r grid cells}
+# Grid cell nearest each station, on the MK-PRISM grid (cells numbered lon-fastest,
+# as the columns of the SSP .txt files). Expected: Paju 357707, Cheorwon 387047.
+nc <- nc_open(paths$nc_grid)
+grid <- expand.grid(lon = as.numeric(ncvar_get(nc, "longitude")),
+                    lat = as.numeric(ncvar_get(nc, "latitude")))
+nc_close(nc)
+cells <- sapply(seq_along(stations), function(i)
+  which.min((grid$lon - station_xy$lon[i])^2 + (grid$lat - station_xy$lat[i])^2))
+
+# Supplementary: grid cell used for each station and its distance from the station
+grid_check <- station_xy %>%
+  mutate(cell = cells, grid_lon = grid$lon[cells], grid_lat = grid$lat[cells],
+         dist_km = 111.32 * sqrt((grid_lat - lat)^2 + ((grid_lon - lon) * cos(lat * pi / 180))^2))
+print(grid_check)
+
+# The SSP files must be on the same grid: number of columns = number of grid cells
+check_cols <- function(file) {
+  n_col <- ncol(data.table::fread(file, nrows = 1, header = FALSE))
+  if (n_col != nrow(grid)) warning(basename(file), ": ", n_col, " columns but ",
+                                   nrow(grid), " grid cells; the station columns may be wrong")
+}
+check_cols(file.path(paths$temp_folder, paste0(paths$temp_prefix, min(FUT_YEARS), ".txt")))
+check_cols(paths$spi6_file)
+```
+
+```{r future}
+# The two station columns of one SSP file, in station order
+read_cells <- function(file) {
+  d <- as.data.frame(data.table::fread(file, header = FALSE, select = cells))
+  setNames(d[, paste0("V", cells)], stations)
+}
+
+# Daily SSP files (one per year) -> Station, Date, Value. 365-day calendar: no 29 Feb.
+read_ssp_daily <- function(folder, prefix) {
+  bind_rows(lapply(FUT_YEARS, function(yr) {
+    d <- read_cells(file.path(folder, paste0(prefix, yr, ".txt")))
+    dates <- seq(as.Date(paste0(yr, "-01-01")), as.Date(paste0(yr, "-12-31")), by = "day")
+    if (nrow(d) == 365) dates <- dates[format(dates, "%m-%d") != "02-29"]
+    d$Date <- dates
+    pivot_longer(d, all_of(stations), names_to = "Station", values_to = "Value")
+  }))
+}
+
+ssp_temp <- read_ssp_daily(paths$temp_folder, paths$temp_prefix) %>% rename(Temp = Value)
+ssp_wind <- read_ssp_daily(paths$wind_folder, paths$wind_prefix) %>% rename(Wind = Value)
+ssp_spi  <- read_cells(paths$spi6_file) %>%
+  mutate(Month_Start = seq(as.Date(paths$spi6_start), by = "month", length.out = n())) %>%
+  pivot_longer(all_of(stations), names_to = "Station", values_to = "SPI6")
+
+# Daily future climate; running means over the full-year series, then winter days only
+future <- inner_join(ssp_temp, ssp_wind, by = c("Station", "Date")) %>%
+  mutate(Month_Start = floor_date(Date, "month")) %>%
+  left_join(ssp_spi, by = c("Station", "Month_Start")) %>%
+  add_running(K) %>%
+  filter(month(Date) %in% WINTER_MONTHS) %>%
+  mutate(Winter = season_year(Date), doy = yday(Date))
+
+# Water quality from the future climate of each day
+nd <- mutate(future, Station = factor(Station, levels = stations))
+future <- future %>%
+  mutate(Pred_Water_Temp  = predict_model(final$wTemp, "wTemp", nd),
+         Pred_BOD         = predict_model(final$BOD,   "BOD",   nd),
+         Pred_DTN         = predict_model(final$DTN,   "DTN",   nd),
+         Pred_Chlorophyll = predict_model(final$Chlor, "Chlor", nd))
+
+# Supplementary: share of future days outside the observed range, for every variable.
+# - Model predictors (Temp_k, Wind_k, SPI6): range on the sampling days the models were
+#   fitted on; outside it, predictions extrapolate the linear relationships.
+# - Daily air temperature and wind: range of the observed daily station climate, Oct-Apr.
+# - Predicted water quality: range of the observed samples; outside it, the predicted value
+#   is beyond anything measured at the stations.
+obs_winter <- filter(daily_obs, month(Date) %in% WINTER_MONTHS)
+range_ref <- tribble(
+  ~Variable, ~Future_col,         ~Reference,
+  "Temp",    "Temp",              "Observed daily station climate (Oct-Apr)",
+  "Wind",    "Wind",              "Observed daily station climate (Oct-Apr)",
+  "Temp_k",  "Temp_k",            "Sampling days used to fit the models",
+  "Wind_k",  "Wind_k",            "Sampling days used to fit the models",
+  "SPI6",    "SPI6",              "Sampling days used to fit the models",
+  "wTemp",   "Pred_Water_Temp",   "Observed water-quality samples",
+  "BOD",     "Pred_BOD",          "Observed water-quality samples",
+  "DTN",     "Pred_DTN",          "Observed water-quality samples",
+  "Chlor",   "Pred_Chlorophyll",  "Observed water-quality samples"
+)
+ref_values <- function(v) if (v %in% c("Temp", "Wind")) obs_winter[[v]] else wq[[v]]
+
+extrapolation <- pmap_dfr(range_ref, function(Variable, Future_col, Reference) {
+  r <- range(ref_values(Variable), na.rm = TRUE)
+  future %>%
+    group_by(Station) %>%
+    summarise(Variable = Variable, Reference = Reference, obs_min = r[1], obs_max = r[2],
+              future_min = min(.data[[Future_col]], na.rm = TRUE),
+              future_max = max(.data[[Future_col]], na.rm = TRUE),
+              pct_below = 100 * mean(.data[[Future_col]] < r[1], na.rm = TRUE),
+              pct_above = 100 * mean(.data[[Future_col]] > r[2], na.rm = TRUE), .groups = "drop")
+}) %>% relocate(Variable, Reference)
+print(extrapolation, n = Inf)
+write_csv(extrapolation, file.path(paths$supp_dir, "S5_extrapolation.csv"))
+```
+
+## 6. Output
+```{r output}
+# Native resolution (no interpolation): daily variables, with each monthly SPI6 value on one day of its month
+future_native_daily <- future %>%
+  mutate(SPI6 = if_else(Date == spi6_day(Month_Start), SPI6, NA_real_)) %>%
+  transmute(Station, Date, Winter,
+            Temperature.C. = Temp, Wind_Speed.m.s. = Wind,
+            Temp_runmean = Temp_k, Wind_runmean = Wind_k, runmean_days = K,
+            SPI6,
+            Pred_Water_Temp, Pred_BOD, Pred_DTN, Pred_Chlorophyll) %>%
+  arrange(Station, Date)
+#write_csv(future_native_daily, file.path(paths$out_dir, "future_env_2031_2070_native_daily_rawSSP.csv"),na = "")
+
+# Native resolution (no interpolation): monthly SPI6, for the months covered by the daily file
+future_native_spi6 <- ssp_spi %>%
+  semi_join(distinct(future, Station, Month_Start), by = c("Station", "Month_Start")) %>%
+  transmute(Station, Month = format(Month_Start, "%Y-%m"), Winter = season_year(Month_Start), SPI6) %>%
+  arrange(Station, Month)
+#write_csv(future_native_spi6, file.path(paths$out_dir, "future_SPI6_2031_2070_native_monthly_rawSSP.csv"))
+
+# Files for 06 (interpolated)
+out_vars <- c("Temperature.C.", "Wind_Speed.m.s.", "SPI6_Smooth",
+              "Pred_Water_Temp", "Pred_BOD", "Pred_DTN", "Pred_Chlorophyll")
+
+future_daily <- future %>%
+  transmute(Station, Date, Winter,
+            Temperature.C. = Temp, Wind_Speed.m.s. = Wind, SPI6_Smooth = SPI6,
+            Pred_Water_Temp, Pred_BOD, Pred_DTN, Pred_Chlorophyll)
+#write_csv(future_daily, file.path(paths$out_dir, "future_env_2031_2070_daily_rawSSP.csv"))
+
+# 30-min series for 06 
+
+# Cubic spline through the anchors, evaluated at t_out; values outside the anchor range are
+# held at the nearest anchor
+spline_at <- function(t_anchor, y, t_out) {
+  ok <- !is.na(y)
+  x  <- as.numeric(t_anchor[ok])
+  f  <- splinefun(x, y[ok], method = "fmm")
+  f(pmin(pmax(as.numeric(t_out), min(x)), max(x)))
+}
+
+# Spline each variable within the groups given by `by`
+interp_spline <- function(grid, anchors, vars, by) {
+  grid %>%
+    group_by(across(all_of(by))) %>%
+    group_modify(function(g, key) {
+      a <- semi_join(anchors, key, by = by) %>% arrange(t)
+      for (v in vars) g[[v]] <- spline_at(a$t, a[[v]], g$Date_Time)
+      g
+    }) %>%
+    ungroup()
+}
+
+# 30-min grid (UTC) covering every KST day of each winter
+grid_30min <- future %>%
+  group_by(Station, Winter) %>%
+  summarise(from = min(Date), to = max(Date), .groups = "drop") %>%
+  mutate(Date_Time = map2(from, to, ~ with_tz(
+    seq(as.POSIXct(paste(.x, "00:00:00"), tz = TZ_LOCAL),
+        as.POSIXct(paste(.y, "23:30:00"), tz = TZ_LOCAL), by = "30 min"), "UTC"))) %>%
+  select(Station, Winter, Date_Time) %>%
+  unnest(Date_Time)
+
+# Anchors: daily climate (all days of the year), monthly SPI6 (all months), daily water quality (winter days)
+anchors_clim <- inner_join(ssp_temp, ssp_wind, by = c("Station", "Date")) %>%
+  transmute(Station, t = anchor_utc(Date), Temperature.C. = Temp, Wind_Speed.m.s. = Wind)
+anchors_spi6 <- ssp_spi %>%
+  transmute(Station, t = anchor_utc(spi6_day(Month_Start)), SPI6_Smooth = SPI6)
+wq_out <- c("Pred_Water_Temp", "Pred_BOD", "Pred_DTN", "Pred_Chlorophyll")
+anchors_wq <- future %>%
+  transmute(Station, Winter, t = anchor_utc(Date), across(all_of(wq_out)))
+
+future_30min <- grid_30min %>%
+  interp_spline(anchors_clim, c("Temperature.C.", "Wind_Speed.m.s."), by = "Station") %>%
+  interp_spline(anchors_spi6, "SPI6_Smooth", by = "Station") %>%
+  interp_spline(anchors_wq, wq_out, by = c("Station", "Winter")) %>%
+  mutate(across(all_of(wq_out), ~ pmax(.x, 0))) %>%      # spline overshoot below 0
+  arrange(Station, Date_Time) %>%
+  select(Station, Date_Time, all_of(out_vars))
+write_csv(future_30min, file.path(paths$out_dir, "future_env_2031_2070_30min_rawSSP.csv"))
+```
+
+## 7. Historical vs. future, cranes in the Hangang
+
+Historical: HMM covariates at the times cranes were in the Hangang (`In_Hangang == 1`),
+averaged per station and day (the future is daily, so both are compared as daily values).
+Future: 2031-2050 values on the same calendar days.
+
+```{r, fig.width=8, fig.height=4}
+hist_env <- read.csv(paths$hmm_data) %>%
+  filter(In_Hangang == 1, Station %in% stations) %>%
+  mutate(Date = as.Date(ymd_hms(roundT, tz = "UTC", truncated = 3), tz = "Asia/Seoul")) %>%
+  filter(month(Date) %in% WINTER_MONTHS) %>%
+  group_by(Station, Date) %>%
+  summarise(across(all_of(var_levels), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  mutate(across(all_of(var_levels), ~ ifelse(is.finite(.x), .x, NA)))
+
+hist_days <- hist_env %>% count(Station, MD = format(Date, "%m-%d"), name = "n_hist")
+fut_matched <- future %>%
+  mutate(MD = format(Date, "%m-%d")) %>%
+  inner_join(hist_days, by = c("Station", "MD")) %>%
+  uncount(n_hist) %>%
+  transmute(Station, Temp, Wind, SPI6, wTemp = Pred_Water_Temp, BOD = Pred_BOD,
+            DTN = Pred_DTN, Chlor = Pred_Chlorophyll)
+
+to_long <- function(d) d %>% select(Station, all_of(var_levels)) %>%
+  pivot_longer(-Station, names_to = "Variable", values_to = "Value")
+cmp_long <- bind_rows(Historical = to_long(hist_env), Future = to_long(fut_matched), .id = "Period") %>%
+  filter(!is.na(Value)) %>%
+  mutate(Variable = factor(Variable, levels = var_levels),
+         Period   = factor(Period, levels = c("Historical", "Future")))
+mu_df <- cmp_long %>% group_by(Variable, Period) %>% summarise(grp_mean = mean(Value), .groups = "drop")
+
+distribution_plot <- ggplot(cmp_long, aes(x = Value, fill = Period)) +
+  geom_density(alpha = 0.5, color = "black", linewidth = 0.5) +
+  geom_vline(data = mu_df, aes(xintercept = grp_mean, color = Period, linetype = Period),
+             linewidth = 0.5, show.legend = FALSE) +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Historical" = "grey", "Future" = "dodgerblue3"),
+                    labels = c("Historical" = "Historical (observed, cranes in Hangang)",
+                               "Future" = "Future (2031-2050, SSP2-4.5)"),
+                    name = NULL) +
+  scale_color_manual(values = c("Historical" = "grey20", "Future" = "dodgerblue4"), name = NULL) +
+  labs(y = "Probability Density") +
+  theme(legend.position = c(0.48, 0.08), panel.spacing.y = unit(20, "pt"),
+        strip.text = element_text(face = "bold", size = 10))
+print(distribution_plot)
+ggsave("/Users/yjkang/Desktop/env_shift_SSP245.pdf", plot = distribution_plot, height = 4, width = 8)
+
+# Supplementary: historical vs. future summary per station
+shift_summary <- cmp_long %>%
+  group_by(Variable, Station, Period) %>%
+  summarise(n = n(), mean = mean(Value), sd = sd(Value), median = median(Value),
+            q05 = quantile(Value, 0.05), q95 = quantile(Value, 0.95), .groups = "drop")
+print(shift_summary, n = Inf)
+write_csv(shift_summary, file.path(paths$supp_dir, "S6_historical_vs_future_summary.csv"))
+
+effect_size <- cmp_long %>%
+  group_by(Variable) %>%
+  group_modify(~ as.data.frame(rank_biserial(Value ~ Period, data = .x))) %>%
+  ungroup() %>%
+  mutate(Effect = cut(abs(r_rank_biserial), c(-Inf, 0.1, 0.3, 0.5, Inf),
+                      labels = c("Negligible", "Small", "Moderate", "Large"), right = FALSE))
+print(effect_size)
+write_csv(effect_size, file.path(paths$supp_dir, "S6_effect_sizes.csv"))
+```
+Effect sizes by $|r_{rb}|$: 
+< 0.10 negligible, 
+0.10-0.30 small, 
+0.30-0.50 moderate,
+≥ 0.50 large. 
+Positive $r_{rb}$: historical values tend to be higher than future values.
+
+
+===============================================================================================================================
+
+## SSP1.2-6 (green scenario) and SSP5.8-5 (worst scenario) models
+
+```{r scenario setup}
+ssp_root <- "/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/SSP"
+
+other_scenarios <- tibble(
+  name  = c("green", "worst"),
+  code  = c("126", "585"),
+  label = c("SSP1-2.6", "SSP5-8.5"),
+  fill  = c("forestgreen", "firebrick3"),   # colours for the section 9 figures
+  line  = c("darkgreen", "firebrick4")
+)
+
+# Folders, file prefixes and SPI6 file pattern of one scenario (same layout as SSP2-4.5)
+scen_paths <- function(name, code) list(
+  temp_folder  = file.path(ssp_root, name, paste0("temperature_SSP", code, "_2031_2070_asc")),
+  temp_prefix  = paste0("AR6_SSP", code, "_5ENSMN_skorea_TA_gridraw_daily_"),
+  wind_folder  = file.path(ssp_root, name, paste0("windspeed_SSP", code, "_2031_2070_asc")),
+  wind_prefix  = paste0("AR6_SSP", code, "_5ENSMN_skorea_WS_gridraw_daily_"),
+  spi6_folder  = file.path(ssp_root, name, paste0("SPI6_SSP", code, "_monthly_2021_2100_asc")),
+  spi6_pattern = paste0("^AR6_SSP", code, "_5ENSMN_skorea_SPI6_gridraw_monthly_2021_2100.*\\.txt$")
+)
+
+# First file in `folder` whose name matches `pattern`; if none, extract the archives in
+# `folder` to a temporary folder and look there
+find_ssp_file <- function(folder, pattern) {
+  look <- function(dir) {
+    if (!dir.exists(dir)) return(character(0))
+    f <- list.files(dir, recursive = TRUE, full.names = TRUE)
+    sort(f[grepl(pattern, basename(f))])
+  }
+  hit <- look(folder)
+  if (length(hit)) return(hit[1])
+  ex_dir <- file.path(tempdir(), "ssp_untar", basename(dirname(folder)), basename(folder))
+  hit <- look(ex_dir)
+  if (length(hit)) return(hit[1])
+  archives <- list.files(folder, pattern = "\\.(tar\\.gz|tgz|tar)$", full.names = TRUE)
+  for (a in archives) untar(a, exdir = ex_dir)
+  hit <- look(ex_dir)
+  if (!length(hit)) stop("No file matching '", pattern, "' in ", folder)
+  hit[1]
+}
+
+# Daily SSP files (one per year) -> Station, Date, Value. As read_ssp_daily(), but finds
+# the files with find_ssp_file()
+read_ssp_daily_scen <- function(folder, prefix) {
+  bind_rows(lapply(FUT_YEARS, function(yr) {
+    d <- read_cells(find_ssp_file(folder, paste0("^", prefix, yr, "(_asc)?\\.txt$")))
+    dates <- seq(as.Date(paste0(yr, "-01-01")), as.Date(paste0(yr, "-12-31")), by = "day")
+    if (nrow(d) == 365) dates <- dates[format(dates, "%m-%d") != "02-29"]
+    stopifnot(nrow(d) == length(dates))
+    d$Date <- dates
+    pivot_longer(d, all_of(stations), names_to = "Station", values_to = "Value")
+  }))
+}
+
+# Section 5 for one scenario: raw SSP climate, running means, predicted water quality
+build_future <- function(sp) {
+  temp_first <- find_ssp_file(sp$temp_folder, paste0("^", sp$temp_prefix, min(FUT_YEARS), "(_asc)?\\.txt$"))
+  spi6_file  <- find_ssp_file(sp$spi6_folder, sp$spi6_pattern)
+  check_cols(temp_first)
+  check_cols(spi6_file)
+
+  ssp_temp <- read_ssp_daily_scen(sp$temp_folder, sp$temp_prefix) %>% rename(Temp = Value)
+  ssp_wind <- read_ssp_daily_scen(sp$wind_folder, sp$wind_prefix) %>% rename(Wind = Value)
+  ssp_spi  <- read_cells(spi6_file) %>%
+    mutate(Month_Start = seq(as.Date(paths$spi6_start), by = "month", length.out = n())) %>%
+    pivot_longer(all_of(stations), names_to = "Station", values_to = "SPI6")
+
+  fut <- inner_join(ssp_temp, ssp_wind, by = c("Station", "Date")) %>%
+    mutate(Month_Start = floor_date(Date, "month")) %>%
+    left_join(ssp_spi, by = c("Station", "Month_Start")) %>%
+    add_running(K) %>%
+    filter(month(Date) %in% WINTER_MONTHS) %>%
+    mutate(Winter = season_year(Date), doy = yday(Date))
+
+  nd <- mutate(fut, Station = factor(Station, levels = stations))
+  fut <- fut %>%
+    mutate(Pred_Water_Temp  = predict_model(final$wTemp, "wTemp", nd),
+           Pred_BOD         = predict_model(final$BOD,   "BOD",   nd),
+           Pred_DTN         = predict_model(final$DTN,   "DTN",   nd),
+           Pred_Chlorophyll = predict_model(final$Chlor, "Chlor", nd))
+
+  list(ssp_temp = ssp_temp, ssp_wind = ssp_wind, ssp_spi = ssp_spi, future = fut)
+}
+
+# Share of future days outside the observed range (as S5_extrapolation above)
+extrapolation_table <- function(fut) {
+  pmap_dfr(range_ref, function(Variable, Future_col, Reference) {
+    r <- range(ref_values(Variable), na.rm = TRUE)
+    fut %>%
+      group_by(Station) %>%
+      summarise(Variable = Variable, Reference = Reference, obs_min = r[1], obs_max = r[2],
+                future_min = min(.data[[Future_col]], na.rm = TRUE),
+                future_max = max(.data[[Future_col]], na.rm = TRUE),
+                pct_below = 100 * mean(.data[[Future_col]] < r[1], na.rm = TRUE),
+                pct_above = 100 * mean(.data[[Future_col]] > r[2], na.rm = TRUE), .groups = "drop")
+  }) %>% relocate(Variable, Reference)
+}
+
+# Section 6 for one scenario: native daily, native monthly SPI6, interpolated daily and 30-min
+write_scenario_outputs <- function(sc, code) {
+  fut <- sc$future
+  tag <- paste0("rawSSP", code)
+
+  native_daily <- fut %>%
+    mutate(SPI6 = if_else(Date == spi6_day(Month_Start), SPI6, NA_real_)) %>%
+    transmute(Station, Date, Winter,
+              Temperature.C. = Temp, Wind_Speed.m.s. = Wind,
+              Temp_runmean = Temp_k, Wind_runmean = Wind_k, runmean_days = K,
+              SPI6,
+              Pred_Water_Temp, Pred_BOD, Pred_DTN, Pred_Chlorophyll) %>%
+    arrange(Station, Date)
+  write_csv(native_daily, file.path(paths$out_dir, paste0("future_env_2031_2070_native_daily_", tag, ".csv")),
+            na = "")
+
+  native_spi6 <- sc$ssp_spi %>%
+    semi_join(distinct(fut, Station, Month_Start), by = c("Station", "Month_Start")) %>%
+    transmute(Station, Month = format(Month_Start, "%Y-%m"), Winter = season_year(Month_Start), SPI6) %>%
+    arrange(Station, Month)
+  write_csv(native_spi6, file.path(paths$out_dir, paste0("future_SPI6_2031_2070_native_monthly_", tag, ".csv")))
+
+  daily <- fut %>%
+    transmute(Station, Date, Winter,
+              Temperature.C. = Temp, Wind_Speed.m.s. = Wind, SPI6_Smooth = SPI6,
+              Pred_Water_Temp, Pred_BOD, Pred_DTN, Pred_Chlorophyll)
+  write_csv(daily, file.path(paths$out_dir, paste0("future_env_2031_2070_daily_", tag, ".csv")))
+
+  grid30 <- fut %>%
+    group_by(Station, Winter) %>%
+    summarise(from = min(Date), to = max(Date), .groups = "drop") %>%
+    mutate(Date_Time = map2(from, to, ~ with_tz(
+      seq(as.POSIXct(paste(.x, "00:00:00"), tz = TZ_LOCAL),
+          as.POSIXct(paste(.y, "23:30:00"), tz = TZ_LOCAL), by = "30 min"), "UTC"))) %>%
+    select(Station, Winter, Date_Time) %>%
+    unnest(Date_Time)
+
+  a_clim <- inner_join(sc$ssp_temp, sc$ssp_wind, by = c("Station", "Date")) %>%
+    transmute(Station, t = anchor_utc(Date), Temperature.C. = Temp, Wind_Speed.m.s. = Wind)
+  a_spi6 <- sc$ssp_spi %>%
+    transmute(Station, t = anchor_utc(spi6_day(Month_Start)), SPI6_Smooth = SPI6)
+  a_wq <- fut %>%
+    transmute(Station, Winter, t = anchor_utc(Date), across(all_of(wq_out)))
+
+  out30 <- grid30 %>%
+    interp_spline(a_clim, c("Temperature.C.", "Wind_Speed.m.s."), by = "Station") %>%
+    interp_spline(a_spi6, "SPI6_Smooth", by = "Station") %>%
+    interp_spline(a_wq, wq_out, by = c("Station", "Winter")) %>%
+    mutate(across(all_of(wq_out), ~ pmax(.x, 0))) %>%
+    arrange(Station, Date_Time) %>%
+    select(Station, Date_Time, all_of(out_vars))
+  #write_csv(out30, file.path(paths$out_dir, paste0("future_env_2031_2070_30min_", tag, ".csv")))
+  invisible(NULL)
+}
+```
+
+## 8. Future climate and water quality, SSP1-2.6 and SSP5-8.5
+
+```{r scenario future}
+scen_out <- list()
+for (i in seq_len(nrow(other_scenarios))) {
+  s  <- other_scenarios[i, ]
+  sc <- build_future(scen_paths(s$name, s$code))
+  scen_out[[s$code]] <- sc
+
+  # Supplementary: extrapolation table per scenario
+  ex <- extrapolation_table(sc$future)
+  cat("\n====", s$label, "====\n")
+  print(ex, n = Inf)
+  write_csv(ex, file.path(paths$supp_dir, paste0("S5_extrapolation_SSP", s$code, ".csv")))
+}
+```
+
+```{r scenario output}
+for (code in names(scen_out)) write_scenario_outputs(scen_out[[code]], code)
+```
+
+## 9. Historical vs. future, cranes in the Hangang: SSP1-2.6 and SSP5-8.5
+
+Same comparison as section 7 (historical HMM covariates while cranes were in the Hangang vs.
+2031-2050 values on the same calendar days), for the other two scenarios.
+
+```{r scenario compare helpers}
+compare_scenario <- function(fut, code, label, fill_col, line_col) {
+  fut_m <- fut %>%
+    mutate(MD = format(Date, "%m-%d")) %>%
+    inner_join(hist_days, by = c("Station", "MD")) %>%
+    uncount(n_hist) %>%
+    transmute(Station, Temp, Wind, SPI6, wTemp = Pred_Water_Temp, BOD = Pred_BOD,
+              DTN = Pred_DTN, Chlor = Pred_Chlorophyll)
+
+  cl <- bind_rows(Historical = to_long(hist_env), Future = to_long(fut_m), .id = "Period") %>%
+    filter(!is.na(Value)) %>%
+    mutate(Variable = factor(Variable, levels = var_levels),
+           Period   = factor(Period, levels = c("Historical", "Future")))
+  mu <- cl %>% group_by(Variable, Period) %>% summarise(grp_mean = mean(Value), .groups = "drop")
+
+  p <- ggplot(cl, aes(x = Value, fill = Period)) +
+    geom_density(alpha = 0.5, color = "black", linewidth = 0.5) +
+    geom_vline(data = mu, aes(xintercept = grp_mean, color = Period, linetype = Period),
+               linewidth = 0.5, show.legend = FALSE) +
+    facet_wrap(~ Variable, scales = "free") +
+    theme_minimal() +
+    scale_fill_manual(values = c("Historical" = "grey", "Future" = fill_col),
+                      labels = c("Historical" = "Historical (observed, cranes in Hangang)",
+                                 "Future" = paste0("Future (2031-2050, ", label, ")")),
+                      name = NULL) +
+    scale_color_manual(values = c("Historical" = "grey20", "Future" = line_col), name = NULL) +
+    labs(y = "Probability Density") +
+    theme(legend.position = c(0.48, 0.08), panel.spacing.y = unit(20, "pt"),
+          strip.text = element_text(face = "bold", size = 10))
+  #ggsave(paste0("/Users/yjkang/Desktop/env_shift_SSP", code, ".pdf"), plot = p, height = 4, width = 8)
+
+  # Supplementary: summary and effect sizes per scenario
+  summ <- cl %>%
+    group_by(Variable, Station, Period) %>%
+    summarise(n = n(), mean = mean(Value), sd = sd(Value), median = median(Value),
+              q05 = quantile(Value, 0.05), q95 = quantile(Value, 0.95), .groups = "drop")
+  #write_csv(summ, file.path(paths$supp_dir, paste0("S6_historical_vs_future_summary_SSP", code, ".csv")))
+
+  es <- cl %>%
+    group_by(Variable) %>%
+    group_modify(~ as.data.frame(rank_biserial(Value ~ Period, data = .x))) %>%
+    ungroup() %>%
+    mutate(Effect = cut(abs(r_rank_biserial), c(-Inf, 0.1, 0.3, 0.5, Inf),
+                        labels = c("Negligible", "Small", "Moderate", "Large"), right = FALSE))
+  list(plot = p, summary = summ, effect_size = es)
+}
+
+cmp_scen <- lapply(setNames(seq_len(nrow(other_scenarios)), other_scenarios$code), function(i) {
+  s <- other_scenarios[i, ]
+  compare_scenario(scen_out[[s$code]]$future, s$code, s$label, s$fill, s$line)
+})
+```
+
+### SSP1-2.6 (green)
+
+```{r compare SSP126, fig.width=8, fig.height=4}
+#print(cmp_scen[["126"]]$plot)
+#print(cmp_scen[["126"]]$summary, n = Inf)
+print(cmp_scen[["126"]]$effect_size)
+```
+
+### SSP5-8.5 (worst)
+
+```{r compare SSP585, fig.width=8, fig.height=4}
+#print(cmp_scen[["585"]]$plot)
+#print(cmp_scen[["585"]]$summary, n = Inf)
+print(cmp_scen[["585"]]$effect_size)
+```
+
+```{r compare all scenarios, fig.width=6, fig.height=4.5}
+# Future values on the historical calendar days (as fut_matched in section 7)
+match_hist_days <- function(fut) {
+  fut %>%
+    mutate(MD = format(Date, "%m-%d")) %>%
+    inner_join(hist_days, by = c("Station", "MD")) %>%
+    uncount(n_hist) %>%
+    transmute(Station, Temp, Wind, SPI6, wTemp = Pred_Water_Temp, BOD = Pred_BOD,
+              DTN = Pred_DTN, Chlor = Pred_Chlorophyll)
+}
+
+period_levels <- c("Historical", "SSP1-2.6", "SSP2-4.5", "SSP5-8.5")
+period_cols   <- c("Historical" = "grey30",  "SSP1-2.6" = "forestgreen",
+                   "SSP2-4.5"   = "dodgerblue3", "SSP5-8.5" = "firebrick2")
+period_labels <- c("Historical" = "Historical Hangang (2018-2024)",
+                   "SSP1-2.6"   = "SSP1-2.6 (2031-2070)",
+                   "SSP2-4.5"   = "SSP2-4.5 (2031-2070)",
+                   "SSP5-8.5"   = "SSP5-8.5 (2031-2070)")
+
+cmp_all <- bind_rows(
+  "Historical" = to_long(hist_env),
+  "SSP1-2.6"   = to_long(match_hist_days(scen_out[["126"]]$future)),
+  "SSP2-4.5"   = to_long(fut_matched),
+  "SSP5-8.5"   = to_long(match_hist_days(scen_out[["585"]]$future)),
+  .id = "Period") %>%
+  filter(!is.na(Value)) %>%
+  mutate(Variable = factor(Variable, levels = var_levels),
+         Period   = factor(Period, levels = period_levels))
+mu_all <- cmp_all %>% group_by(Variable, Period) %>% summarise(grp_mean = mean(Value), .groups = "drop")
+
+all_plot <- ggplot(cmp_all, aes(x = Value, fill = Period, color = Period)) +
+  geom_density(alpha = 0.1, linewidth = 0.5) +
+  geom_vline(data = mu_all, aes(xintercept = grp_mean, color = Period),
+             linetype = "dashed", linewidth = 0.3, show.legend = FALSE) +
+  facet_wrap(~ Variable, scales = "free") +
+  theme_minimal() +
+  scale_fill_manual(values = period_cols, labels = period_labels, name = NULL) +
+  scale_color_manual(values = period_cols, labels = period_labels, name = NULL) +
+  labs(y = "Probability Density") +
+  theme(legend.position = c(0.68, 0.14), panel.spacing.y = unit(20, "pt"),
+        strip.text = element_text(face = "bold", size = 10))
+print(all_plot)
+#ggsave("/Users/yjkang/Desktop/env_shift_all_SSP.pdf", plot = all_plot, height = 4.5, width = 6)
+```
+
+
+

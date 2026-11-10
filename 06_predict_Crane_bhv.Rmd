@@ -1,0 +1,973 @@
+---
+title: "BigData_Wetland_migratoryBirds"
+author: "Youn Jae Kang"
+date: "2026-04-16"
+output: html_document
+---
+
+What factor of a wetland affects migratory birds? and if the factor changes in the future, how will behaviour change?
+
+Every downstream step (stationary distribution with parameter-uncertainty intervals, simulated
+trajectories, bout lengths, energy budget) is run for each SSP in `ssp_files` and compared
+against the same historical baseline.
+
+```{r load package, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ranger)
+library(tidyverse)
+library(lubridate)
+library(momentuHMM)
+```
+
+```{r}
+hmm_model <- readRDS("/Users/yjkang/Desktop/NIE_BigData/Dyn_Crane_HMM_UTC.rds")
+#print(hmm_model)
+
+# Historical mean/SD of each raw covariate, saved in 04 from the data the HMM was fitted to
+scaling_ref <- readRDS("/Users/yjkang/Desktop/NIE_BigData/HMM_scaling_ref.rds")
+z_ref <- function(x, var) (x - scaling_ref[[paste0(var, "_mu")]]) / scaling_ref[[paste0(var, "_sd")]]
+
+# Safety check: the reference must reproduce the Z-scores stored in the fitted model.
+# If this fails, the .rds files come from different runs of 04.
+ref_check <- hmm_model$data %>% filter(In_Hangang == 1)
+for (v in c("Temp", "Wind", "wTemp", "BOD", "Chlor", "DTN", "SPI6")) {
+  ok <- !is.na(ref_check[[v]])
+  stopifnot(isTRUE(all.equal(z_ref(ref_check[[v]][ok], v),
+                             ref_check[[paste0("Z_", v)]][ok], tolerance = 1e-8)))
+}
+```
+
+```{r scenario setup}
+horizon <- 20
+shift_years <- function(t) t + years(horizon)   # 29 Feb -> NA when the target year isn't a leap year
+
+env_dir <- "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/supp05_predict_env"
+ssp_files <- c(
+  "SSP1-2.6" = file.path(env_dir, "future_env_2031_2070_30min_rawSSP126.csv"),
+  "SSP2-4.5" = file.path(env_dir, "future_env_2031_2070_30min_rawSSP.csv"), 
+  "SSP5-8.5" = file.path(env_dir, "future_env_2031_2070_30min_rawSSP585.csv")
+)
+stopifnot(all(file.exists(ssp_files)))
+scenarios <- names(ssp_files)
+
+hist_years    <- range(year(with_tz(hmm_model$data$roundT, "Asia/Seoul")))   # 2018-2024 (04 starts at the Cheorwon sensor, Feb 2018)
+hist_label    <- paste0("Historical (", hist_years[1], "-", hist_years[2], ")")
+fut_window    <- paste0(hist_years[1] + horizon, "-", hist_years[2] + horizon)  # label for the projected window
+out_tag       <- paste0("_h", horizon)       # appended to saved file names so runs don't overwrite each other
+period_levels <- c(hist_label, scenarios)
+behav_levels  <- c("Traveling", "Foraging", "Roosting")
+period_fill   <- setNames(c("gray50", "#009E73", "#0072B2", "#D55E00"), period_levels)
+period_col    <- setNames(c("gray30", "#009E73", "#0072B2", "#D55E00"), period_levels)
+message("Projection horizon: +", horizon, " years (", fut_window, ")")
+```
+
+```{r}
+# map future data & normalise with the historical mean/SD
+prep_future_covs <- function(path) {
+  read.csv(path) %>%
+    mutate(
+      Date_Time = as.POSIXct(Date_Time, format="%Y-%m-%dT%H:%M:%SZ", tz="UTC"),
+      In_Hangang = 1,
+      Han_Temp   = z_ref(Temperature.C.,   "Temp"),
+      Han_Wind   = z_ref(Wind_Speed.m.s.,  "Wind"),
+      Han_SPI6   = z_ref(SPI6_Smooth,      "SPI6"),
+      Han_wTemp  = z_ref(Pred_Water_Temp,  "wTemp"),
+      Han_BOD    = z_ref(Pred_BOD,         "BOD"),
+      Han_DTN    = z_ref(Pred_DTN,         "DTN"),
+      Han_Chlor  = z_ref(Pred_Chlorophyll, "Chlor")
+    ) %>%
+    filter(month(with_tz(Date_Time, "Asia/Seoul")) %in% c(10, 11, 12, 1, 2, 3, 4)) %>%
+    select(Station, Date_Time, In_Hangang, Han_Temp, Han_Wind,
+           Han_wTemp, Han_BOD, Han_Chlor, Han_DTN, Han_SPI6) %>%
+    na.omit()
+}
+future_covs_list <- lapply(ssp_files, prep_future_covs)   # named list: one data frame per SSP
+
+# Projected shift of each covariate, in historical SD units (0 = no change from the fitted data)
+bind_rows(future_covs_list, .id = "Scenario") %>%
+  group_by(Scenario) %>%
+  summarise(across(starts_with("Han_"), list(mean = mean, sd = sd)), .groups = "drop") %>%
+  pivot_longer(-Scenario, names_to = c("Covariate", ".value"), names_pattern = "(.*)_(mean|sd)$") %>%
+  arrange(Covariate, Scenario) %>%
+  print(n = Inf)
+```
+
+=======================================
+Stationary distribution: historical vs future
+=======================================
+: the long-term expected proportion of time in State 1, 2, or 3 given a specific environment.
+For every hourly step, the transition matrix is built from the fitted $\beta$ coefficients and its
+stationary distribution is computed; these are averaged within each KST day, then over days.
+B coefficient sets are drawn from the MLE's sampling distribution, beta ~ MVN(beta_hat, Sigma), 
+and every period is evaluated with the same draw.
+```{r stationary helpers}
+# States: 1 = Traveling, 2 = Foraging, 3 = Roosting
+stationary_3state <- function(X, beta) {
+  e  <- exp(X %*% beta)
+  s1 <- 1 + e[, 1] + e[, 2]
+  s2 <- 1 + e[, 3] + e[, 4]
+  s3 <- 1 + e[, 5] + e[, 6]
+  g12 <- e[, 1] / s1; g13 <- e[, 2] / s1
+  g21 <- e[, 3] / s2; g23 <- e[, 4] / s2
+  g31 <- e[, 5] / s3; g32 <- e[, 6] / s3
+  P <- cbind(Traveling = g21 * g31 + g23 * g31 + g32 * g21,
+             Foraging  = g12 * g32 + g13 * g32 + g31 * g12,
+             Roosting  = g13 * g23 + g12 * g23 + g21 * g13)
+  P <- P / rowSums(P)
+  if (any(!is.finite(P))) stop("Non-finite stationary probabilities (exp overflow in a draw?)")
+  P
+}
+
+# Design matrix with exactly the columns (and order) of beta
+make_X <- function(data, formula, beta) {
+  X <- model.matrix(formula, data = data)
+  if (nrow(X) != nrow(data)) stop("model.matrix() dropped rows with NA covariates")
+  missing_cols <- setdiff(rownames(beta), colnames(X))
+  if (length(missing_cols) > 0) {
+    message("Filling missing columns with 0: ", paste(missing_cols, collapse = ", "))
+    X <- cbind(X, matrix(0, nrow(X), length(missing_cols),
+                         dimnames = list(NULL, missing_cols)))
+  }
+  extra_cols <- setdiff(colnames(X), rownames(beta))
+  if (length(extra_cols) > 0)
+    message("Ignoring extra columns: ", paste(extra_cols, collapse = ", "))
+  X[, rownames(beta), drop = FALSE]
+}
+
+# A period = design matrix + grouping of its rows into KST calendar days
+make_period <- function(X, time) {
+  f <- factor(as.Date(time, tz = "Asia/Seoul"))
+  g <- as.integer(f)
+  list(X = X, g = g, n = tabulate(g), days = as.Date(levels(f)))
+}
+
+# Period mean = mean of daily means (each day weighted equally)
+period_means <- function(d, beta) {
+  colMeans(rowsum(stationary_3state(d$X, beta), d$g) / d$n)
+}
+
+# Daily series in long format (for plots)
+daily_series <- function(d, beta, label) {
+  as.data.frame(rowsum(stationary_3state(d$X, beta), d$g) / d$n) %>%
+    mutate(Date = d$days, Period = label) %>%
+    pivot_longer(all_of(behav_levels), names_to = "Behavior", values_to = "Probability")
+}
+
+q <- function(x, p) unname(quantile(x, p))
+```
+
+```{r stationary periods}
+beta_coeffs <- hmm_model$mle$beta 
+cov_formula <- ~ Han_Temp + Han_Wind + Han_wTemp + Han_BOD + Han_Chlor + Han_DTN + Han_SPI6
+
+# Historical covariates of the fitted HMM data
+hist_hangang_data <- hmm_model$data #%>% filter(In_Hangang == 1)
+
+# Future data matched to historical dates
+match_date_df <- hmm_model$data %>%
+  mutate(match_key = shift_years(roundT)) %>%
+  select(Station, roundT, match_key)
+
+# Steps with no calendar counterpart (29 Feb when roundT + horizon isn't a leap year)
+n_no_key <- sum(is.na(match_date_df$match_key))
+if (n_no_key > 0)
+  message(n_no_key, " historical steps (29 Feb) have no date ", horizon,
+          " years later; they are dropped from every future period")
+
+# Shifted historical dates must fall inside the future covariate files
+cov_range <- range(do.call(c, lapply(future_covs_list, function(d) range(d$Date_Time))))
+key_range <- range(match_date_df$match_key, na.rm = TRUE)
+if (key_range[1] < cov_range[1] || key_range[2] > cov_range[2])
+  warning("Shifted historical dates (", format(key_range[1]), " to ", format(key_range[2]),
+          " UTC) extend beyond the future covariates (", format(cov_range[1]), " to ",
+          format(cov_range[2]), " UTC); steps outside are dropped")
+
+prep_future_period <- function(fc, scenario) {
+  mf <- match_date_df %>%
+    left_join(fc %>% mutate(match_key = as.POSIXct(Date_Time)),
+              by = c("match_key", "Station")) %>%
+    select(-roundT, -match_key)
+  n_before <- nrow(mf)
+  mf <- mf %>% drop_na(Date_Time, starts_with("Han_"))
+  if (nrow(mf) < n_before)
+    message(scenario, ": ", n_before - nrow(mf), " of ", n_before,
+            " historical steps without a future match dropped")
+  make_period(make_X(mf, cov_formula, beta_coeffs), mf$Date_Time)
+}
+
+period_list <- c(
+  setNames(list(make_period(make_X(hist_hangang_data, hmm_model$conditions$formula, beta_coeffs),
+                            hist_hangang_data$time)), hist_label),
+  setNames(lapply(scenarios, function(s) prep_future_period(future_covs_list[[s]], s)), scenarios))
+
+# Covariate shift over the matched window only (historical SD units)
+bind_rows(lapply(scenarios, function(s)
+  as.data.frame(period_list[[s]]$X) %>% mutate(Scenario = s))) %>%
+  group_by(Scenario) %>%
+  summarise(across(starts_with("Han_"), mean), .groups = "drop") %>%
+  pivot_longer(-Scenario, names_to = "Covariate", values_to = "Mean_shift_SD") %>%
+  arrange(Covariate, Scenario) %>%
+  print(n = Inf)
+```
+
+```{r coefficient draws}
+B_draws <- 1000
+set.seed(2026)
+
+# Locate beta inside the working-parameter vector and take its covariance block
+beta_block <- function(m) {
+  Sig <- m$mod$Sigma
+  if (is.null(Sig)) Sig <- MASS::ginv(m$mod$hessian)
+  if (any(!is.finite(Sig))) stop("Covariance matrix has NA/Inf: Hessian not invertible for this fit")
+  wpar <- if (!is.null(m$mod$wpar) && length(m$mod$wpar) == nrow(Sig)) m$mod$wpar else m$mod$estimate
+  b  <- as.vector(m$mle$beta)
+  nb <- length(b)
+  hit <- which(vapply(seq_len(length(wpar) - nb + 1), function(st)
+    isTRUE(all.equal(unname(wpar[st:(st + nb - 1)]), b, tolerance = 1e-8)), logical(1)))
+  if (length(hit) != 1)
+    stop("Couldn't locate beta in the working parameters (betaCons/betaRef/mixtures?); set indices manually")
+  idx <- hit:(hit + nb - 1)
+  list(mu = b, Sigma = Sig[idx, idx], dim = dim(m$mle$beta), dimnames = dimnames(m$mle$beta))
+}
+
+draw_betas <- function(fits, B) {
+  blocks <- lapply(fits, beta_block)
+  pick   <- sample(seq_along(fits), B, replace = TRUE)
+  out    <- vector("list", B)
+  for (k in seq_along(fits)) {
+    ii <- which(pick == k)
+    if (length(ii) == 0) next
+    bk <- blocks[[k]]
+    dr <- matrix(MASS::mvrnorm(length(ii), mu = bk$mu, Sigma = bk$Sigma), nrow = length(ii))
+    for (j in seq_along(ii))
+      out[[ii[j]]] <- matrix(dr[j, ], bk$dim[1], bk$dim[2], dimnames = bk$dimnames)
+  }
+  out
+}
+
+fits <- list(hmm_model)
+beta_draws <- draw_betas(fits, B_draws)
+```
+
+```{r effect sizes}
+# Effect sizes for a list of periods (first = reference). Point estimate at the MLE,
+# 95% percentile intervals across coefficient draws (same draw for every period).
+effect_sizes <- function(plist, draws, ref = hist_label) {
+  per <- names(plist)
+  est <- sapply(plist, period_means, beta = beta_coeffs)                  # states x periods
+  arr <- simplify2array(lapply(draws, function(b)                          # states x periods x B
+    sapply(plist, period_means, beta = b)))
+  dimnames(arr) <- list(behav_levels, per, NULL)
+
+  probs <- expand.grid(Behavior = behav_levels, Period = per, stringsAsFactors = FALSE)
+  probs <- probs %>%
+    mutate(Estimate = est[cbind(Behavior, Period)],
+           Lower    = mapply(function(b, p) q(arr[b, p, ], .025), Behavior, Period),
+           Upper    = mapply(function(b, p) q(arr[b, p, ], .975), Behavior, Period),
+           Hours_per_day = 24 * Estimate,
+           Period   = factor(Period, levels = period_levels),
+           Behavior = factor(Behavior, levels = behav_levels)) %>%
+    as_tibble()
+
+  futs  <- setdiff(per, ref)
+  pairs <- rbind(cbind(ref = ref, cmp = futs),
+                 if (length(futs) > 1) { cb <- t(combn(futs, 2)); cbind(ref = cb[, 1], cmp = cb[, 2]) })
+
+  contrasts <- bind_rows(lapply(seq_len(nrow(pairs)), function(i) {
+    r <- pairs[i, "ref"]; cmp <- pairs[i, "cmp"]
+    bind_rows(lapply(behav_levels, function(s) {
+      d_draw <- 100 * (arr[s, cmp, ] - arr[s, r, ])     # percentage points
+      r_draw <- arr[s, cmp, ] / arr[s, r, ]
+      tibble(
+        Behavior   = s,
+        Ref        = r,
+        Cmp        = cmp,
+        Contrast   = paste(cmp, "vs", r),
+        Ref_prob   = est[s, r],
+        Cmp_prob   = est[s, cmp],
+        Diff_pp    = 100 * (est[s, cmp] - est[s, r]),
+        Diff_lo    = q(d_draw, .025),
+        Diff_hi    = q(d_draw, .975),
+        Diff_h_day = 24 * (est[s, cmp] - est[s, r]),    # same shift in hours/day
+        Ratio      = est[s, cmp] / est[s, r],
+        Ratio_lo   = q(r_draw, .025),
+        Ratio_hi   = q(r_draw, .975),
+        P_increase = mean(d_draw > 0)                    # share of draws with an increase
+      )
+    }))
+  })) %>%
+    mutate(Behavior = factor(Behavior, levels = behav_levels))
+
+  list(est = est, arr = arr, probs = probs, contrasts = contrasts)
+}
+
+es_main <- effect_sizes(period_list, beta_draws)
+
+print(es_main$probs, n = Inf)
+es_main$contrasts %>%
+  select(-Ref, -Cmp) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  print(n = Inf, width = Inf)
+```
+
+```{r, fig.width=6.5, fig.height=3.2}
+# Shift in stationary probability vs historical (percentage points = % of the day)
+plot_shift <- es_main$contrasts %>%
+  filter(Ref == hist_label) %>%
+  mutate(Cmp = factor(Cmp, levels = period_levels)) %>%
+  ggplot(aes(x = Diff_pp, y = Behavior, colour = Cmp)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_pointrange(aes(xmin = Diff_lo, xmax = Diff_hi),
+                  position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = period_col) +
+  scale_y_discrete(limits = rev(behav_levels)) +
+  labs(x = "Change in stationary probability vs historical (percentage points)",
+       y = NULL, colour = NULL,
+       caption = paste0("Point = MLE; bars = 95% interval over ", B_draws,
+                        " coefficient draws. SSP projections: ", fut_window)) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+print(plot_shift)
+#ggsave(paste0("/Users/yjkang/Desktop/stationary_shift", out_tag, ".pdf"), plot = plot_shift, width = 6.5, height = 3.2)
+
+# Daily stationary probabilities at the MLE (for time-series / distribution plots)
+daily_mle <- bind_rows(lapply(names(period_list), function(p)
+  daily_series(period_list[[p]], beta_coeffs, p))) %>%
+  mutate(Period   = factor(Period, levels = period_levels),
+         Behavior = factor(Behavior, levels = behav_levels))
+```
+
+=======================================
+Stationary probabilities across projection horizons
+=======================================
+Deviation = future winter minus historical, in percentage points, paired over coefficient draws.
+```{r winter temp}
+set.seed(2026)
+B_trend     <- 1000       # coefficient draws used here (subset of beta_draws; raise for the final run)
+draws_trend <- beta_draws[seq_len(min(B_trend, length(beta_draws)))]
+min_cover   <- 0.95      # drop winters only partly covered by the future files (e.g. 2030/31, 2070/71)
+bin_years   <- 5         # winters averaged per point in the table/trend/plot (1 = every winter)
+
+# Winter start year by KST calendar: Oct-Dec -> that year, Jan-Apr -> previous year
+winter_of <- function(t) {
+  lt <- with_tz(t, "Asia/Seoul")
+  year(lt) - as.integer(month(lt) <= 4)
+}
+
+# Historical tracking design, re-dated into every future winter
+template    <- hist_hangang_data %>% transmute(Station, roundT, W_hist = winter_of(roundT))
+fut_winters <- sort(Reduce(intersect, lapply(future_covs_list, function(fc) unique(winter_of(fc$Date_Time)))))
+template_all <- bind_rows(lapply(fut_winters, function(W)
+  template %>% mutate(Winter = W, match_key = roundT + years(W - W_hist)))) %>%
+  filter(!is.na(match_key))                                  # 29 Feb -> non-leap year
+
+# Historical baseline (same as the main analysis) at the MLE and at each draw
+hist_est <- period_means(period_list[[hist_label]], beta_coeffs)
+hist_arr <- sapply(draws_trend, function(b) period_means(period_list[[hist_label]], b))   # 3 x B
+
+# Per-winter stationary probabilities minus historical, in pp
+winter_deviation <- function(fc) {
+  d <- template_all %>%
+    inner_join(fc %>% mutate(match_key = Date_Time), by = c("match_key", "Station")) %>%
+    drop_na(starts_with("Han_"))
+  X   <- make_X(d, cov_formula, beta_coeffs)
+  g   <- as.integer(interaction(d$Winter, as.Date(d$Date_Time, tz = "Asia/Seoul"),
+                                drop = TRUE, lex.order = TRUE))   # winter x KST day
+  n_g <- tabulate(g)
+  wg  <- d$Winter[match(seq_along(n_g), g)]                    # winter of each day group
+  winters <- sort(unique(wg))
+  n_w <- tabulate(match(wg, winters))                          # days per winter
+  wmeans <- function(b) rowsum(rowsum(stationary_3state(X, b), g) / n_g, wg) / n_w
+
+  cover <- tabulate(match(d$Winter, winters)) / nrow(template)
+  keep  <- cover >= min_cover
+  est <- 100 * sweep(wmeans(beta_coeffs), 2, hist_est)
+  arr <- 100 * sweep(simplify2array(lapply(draws_trend, wmeans)), c(2, 3), hist_arr)
+  dimnames(est) <- list(NULL, behav_levels)
+  dimnames(arr) <- list(NULL, behav_levels, NULL)
+  list(winters = winters[keep], cover = cover[keep],
+       est = est[keep, , drop = FALSE], arr = arr[keep, , , drop = FALSE])
+}
+wt <- lapply(future_covs_list, winter_deviation)   # per winter (also used by the decadal direction plot)
+
+# ---- Average consecutive winters into bins of bin_years ----
+# Each winter weighted equally within a bin; draws stay paired.
+bin_winters <- function(r, k = bin_years) {
+  W     <- r$winters
+  start <- min(W) + k * ((W - min(W)) %/% k)
+  bins  <- sort(unique(start))
+  idx   <- match(start, bins)
+  n     <- tabulate(idx)
+  nb    <- length(bins); B <- dim(r$arr)[3]
+  last  <- as.vector(tapply(W, idx, max))
+  est   <- rowsum(r$est, idx) / n
+  arr   <- array(rowsum(matrix(r$arr, nrow = length(W)), idx) / n, dim = c(nb, length(behav_levels), B))
+  dimnames(est) <- list(NULL, behav_levels)
+  dimnames(arr) <- list(NULL, behav_levels, NULL)
+  list(winters   = as.vector(tapply(W, idx, mean)),          # bin midpoint (x position)
+       label     = if (k == 1) as.character(bins) else paste0(bins, "-", last),
+       n_winters = n,
+       cover     = as.vector(tapply(r$cover, idx, mean)),
+       est = est, arr = arr)
+}
+wt_plot <- lapply(wt, bin_winters)
+
+# ---- Per-bin table ----
+wt_tab <- bind_rows(lapply(scenarios, function(s) {
+  r <- wt_plot[[s]]
+  bind_rows(lapply(behav_levels, function(b) {
+    dm <- matrix(r$arr[, b, ], nrow = length(r$winters))     # change vs historical (pp), bins x draws
+    ab <- sweep(dm / 100, 2, hist_arr[b, ], "+")              # absolute probability, bins x draws
+    tibble(Scenario = s, Behavior = b, Winter = r$winters, Label = r$label, N_winters = r$n_winters,
+           Coverage = r$cover,
+           Diff_pp  = r$est[, b],
+           Lo       = apply(dm, 1, q, .025),
+           Hi       = apply(dm, 1, q, .975),
+           Estimate = hist_est[[b]] + r$est[, b] / 100,
+           Lower    = apply(ab, 1, q, .025),
+           Upper    = apply(ab, 1, q, .975))
+  }))
+})) %>%
+  mutate(Scenario = factor(Scenario, levels = scenarios),
+         Behavior = factor(Behavior, levels = behav_levels))
+
+# ---- pp per decade and mean deviation over all future winters ----
+ols <- function(x, y) {
+  xc <- x - mean(x); b <- sum(xc * y) / sum(xc^2)
+  r  <- y - mean(y) - b * xc
+  c(slope = b, se = sqrt(sum(r^2) / (length(x) - 2) / sum(xc^2)))
+}
+trend_tab <- bind_rows(lapply(scenarios, function(s) bind_rows(lapply(behav_levels, function(b) {
+  r  <- wt_plot[[s]]; x <- r$winters
+  sl <- apply(r$arr[, b, ], 2, function(y) { f <- ols(x, y); f[["slope"]] + rnorm(1, 0, f[["se"]]) })
+  md <- colMeans(r$arr[, b, ])
+  tibble(Scenario        = s,
+         Behavior        = factor(b, levels = behav_levels),
+         Winters         = paste0(r$label[1], " ... ", tail(r$label, 1), " (", length(x), " points)"),
+         Mean_dev_pp     = mean(r$est[, b]),
+         Mean_lo         = q(md, .025),
+         Mean_hi         = q(md, .975),
+         Between_winter_SD = sd(r$est[, b]),
+         Slope_pp_decade = 10 * ols(x, r$est[, b])[["slope"]],
+         Slope_lo        = 10 * q(sl, .025),
+         Slope_hi        = 10 * q(sl, .975),
+         P_slope_pos     = mean(sl > 0))
+}))))
+trend_tab %>% arrange(Behavior, Scenario) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>% print(n = Inf, width = Inf)
+```
+Against the observed historical baseline (Traveling 0.121, Foraging 0.438, Roosting 0.441):
+
+- Traveling: +0.8 to +1.2 pp, roughly +11 to 17 min/day, or about 7–10% more than the baseline of 12%. The increase is smallest under SSP2-4.5 (+0.80 pp); SSP1-2.6 and SSP5-8.5 are almost equal (+1.20 and +1.19 pp).
+- Roosting: −1.1 to −1.6 pp, roughly −16 to 23 min/day, about 2.4–3.6% less than the baseline of 44%. The decrease is largest under SSP5-8.5 (−1.59 pp, about −23 min/day).
+- Foraging: essentially unchanged, between −0.1 and +0.4 pp, roughly −2 to +6 min/day, which is less than 1% of the baseline of 44%.
+shift from roosting toward traveling
+
+```{r winter trend, fig.width=9, fig.height=3.8}
+# ---- Figure 1: stationary probability per bin, all SSPs vs historical ----
+# Historical point/interval from the same draws as the future bins
+hist_pt <- tibble(Period   = factor(hist_label, levels = period_levels),
+                  Behavior = factor(behav_levels, levels = behav_levels),
+                  Estimate = unname(hist_est),
+                  Lower    = apply(hist_arr, 1, q, .025),
+                  Upper    = apply(hist_arr, 1, q, .975))
+hist_mid <- mean(hist_years)
+lb       <- distinct(wt_tab, Winter, Label) %>% arrange(Winter)
+thin_x   <- if (nrow(lb) > 12) seq(1, nrow(lb), by = 5) else seq_len(nrow(lb))   # fewer labels per winter
+
+plot_winter <- ggplot(wt_tab %>% mutate(Period = factor(Scenario, levels = period_levels)),
+                      aes(x = Winter, y = Estimate, colour = Period)) +
+  geom_hline(data = hist_pt, aes(yintercept = Estimate), linetype = 2, colour = "grey60") +
+  geom_ribbon(aes(ymin = Lower, ymax = Upper, fill = Period, group = Period),
+              alpha = 0.12, colour = NA) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = if (bin_years == 1) 1 else 1.8) +
+  geom_pointrange(data = hist_pt,
+                  aes(x = hist_mid, y = Estimate, ymin = Lower, ymax = Upper, colour = Period),
+                  inherit.aes = FALSE) +
+  facet_wrap(~ Behavior, ncol = 3, scales = "free_y") +
+  scale_colour_manual(values = period_col, breaks = period_levels) +
+  scale_fill_manual(values = period_fill, guide = "none") +
+  scale_x_continuous(breaks = c(hist_mid, lb$Winter[thin_x]),
+                     labels = c(paste0(hist_years[1], "-", hist_years[2]), lb$Label[thin_x])) +
+  labs(y = "Stationary probability", colour = NULL,
+       caption = paste0("Lines/points = MLE ",
+                        if (bin_years == 1) "per winter" else paste0("per ", bin_years, "-winter mean"),
+                        "; ribbons and bars = 95% interval over ", length(draws_trend),
+                        " coefficient draws. Dashed = historical baseline.\n",
+                        "Historical tracking design applied to every future winter. ",
+                        "Draws are paired, so test differences with Diff_pp/Lo/Hi in wt_tab, not ribbon overlap.")) +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(size = 7, angle = 45, hjust = 1))
+print(plot_winter)
+#ggsave("/Users/yjkang/Desktop/stationary_winter.pdf", plot = plot_winter, width = 9, height = 3.8)
+```
+
+==========================
+Simulate Future Sequences
+==========================
+```{r}
+set.seed(2026)
+B_seq      <- 500    # coefficient draws
+min_steps  <- 200    # skip historical winters with fewer Hangang steps
+sim_levels <- c(hist_label, scenarios)
+#metric_names <- c("Bouts per day | Foraging", "Mean bout (h) | Foraging", "Mean gap between foraging (h)")
+metric_names <- c(paste("Bouts per day |", behav_levels),
+                  paste("Mean bout (h) |", behav_levels),
+                  paste0("Mean gap between ", tolower(behav_levels), " (h)"))
+
+# Continuous 1-h segments per bird (a new segment at every gap or change of bird)
+make_seg <- function(id, t) {
+  tt <- as.numeric(t)
+  cumsum(c(TRUE, id[-1] != id[-length(id)] | diff(tt) != 3600))
+}
+
+hrows <- hist_hangang_data %>%
+  mutate(row = row_number(), W_hist = winter_of(roundT)) %>%
+  arrange(ID, roundT) %>%
+  select(row, ID, Station, roundT, W_hist)
+hist_w <- split(hrows, hrows$W_hist)
+hist_w <- hist_w[vapply(hist_w, nrow, integer(1)) >= min_steps]
+fut_winters_ok <- wt[[scenarios[1]]]$winters     # all future winters (2031-2069 starts)
+fc_by_winter   <- lapply(future_covs_list, function(fc) split(fc, winter_of(fc$Date_Time)))
+
+X_obs <- make_X(hist_hangang_data, hmm_model$conditions$formula, beta_coeffs)
+
+# Markov chain with time-varying TPM; the transition into step t uses the covariates at t-1
+# (a one-step offset has negligible effect at 1-h steps). Each segment starts from the
+# stationary distribution at its first step. States: 1 Traveling, 2 Foraging, 3 Roosting.
+sim_states <- function(X, beta, seg, u) {
+  e  <- exp(X %*% beta)
+  s1 <- 1 + e[, 1] + e[, 2]; s2 <- 1 + e[, 3] + e[, 4]; s3 <- 1 + e[, 5] + e[, 6]
+  C  <- list(cbind(1 / s1,      (1 + e[, 1]) / s1),         # cumulative P(->1), P(->1 or 2) from 1
+             cbind(e[, 3] / s2, (e[, 3] + 1) / s2),         # from 2
+             cbind(e[, 5] / s3, (e[, 5] + e[, 6]) / s3))    # from 3
+  n     <- nrow(X)
+  start <- c(TRUE, seg[-1] != seg[-n])
+  P0    <- matrix(NA_real_, n, 3)
+  P0[start, ] <- stationary_3state(X[start, , drop = FALSE], beta)
+  st <- integer(n)
+  for (t in seq_len(n)) {
+    cp    <- if (start[t]) c(P0[t, 1], P0[t, 1] + P0[t, 2]) else C[[st[t - 1]]][t - 1, ]
+    st[t] <- 1L + (u[t] > cp[1]) + (u[t] > cp[2])
+  }
+  st
+}
+
+# Bout metrics per state. Bout and gap lengths use complete runs only (not cut by a segment edge).
+#seq_metrics <- function(st, seg) {
+#  n     <- length(st)
+#  same  <- c(FALSE, seg[-1] == seg[-n])               # step continues the previous step's segment
+#  f     <- st == 2L
+#  id    <- cumsum(!same | c(TRUE, f[-1] != f[-n]))    # runs of foraging / not foraging
+#  len   <- tabulate(id)
+#  first <- match(seq_along(len), id); last <- first + len - 1
+#  value    <- f[first]
+#  complete <- same[first] & c(same[-1], FALSE)[last]
+#  bouts <- len[value & complete]
+#  gaps  <- len[!value & complete]
+#  setNames(c(sum(same & f & !c(FALSE, f[-n])) / n * 24,
+#             if (length(bouts)) mean(bouts) else NA_real_,
+#             if (length(gaps))  mean(gaps)  else NA_real_), metric_names)
+#}
+seq_metrics <- function(st, seg) {
+  n    <- length(st)
+  same <- c(FALSE, seg[-1] == seg[-n])                # step continues the previous step's segment
+  prev <- c(0L, st[-n])
+  sw   <- same & st != prev                           # switch into st at this step
+  runs <- function(x) {                               # complete runs of x: values and lengths
+    id    <- cumsum(!same | c(TRUE, x[-1] != x[-n]))
+    len   <- tabulate(id)
+    first <- match(seq_along(len), id); last <- first + len - 1
+    keep  <- same[first] & c(same[-1], FALSE)[last]
+    list(value = x[first][keep], len = len[keep])
+  }
+  r <- runs(st)
+  mbout <- function(k) { x <- r$len[r$value == k]; if (length(x)) mean(x) else NA_real_ }
+  # gap = complete run of steps NOT in state k, between two bouts of k
+  mgap  <- function(k) { g <- runs(st == k); x <- g$len[!g$value]; if (length(x)) mean(x) else NA_real_ }
+  setNames(c(sapply(1:3, function(k) sum(sw & st == k)) / n * 24,
+             sapply(1:3, mbout),
+             sapply(1:3, mgap)), metric_names)
+}
+
+# spread across draws reflects parameter uncertainty
+h_order <- rep_len(sample(length(hist_w)), length(fut_winters_ok))
+design  <- lapply(seq_along(fut_winters_ok), function(j) {
+  h  <- hist_w[[h_order[j]]]
+  Wf <- fut_winters_ok[j]
+  keys <- h %>% transmute(row, Station, match_key = roundT + years(Wf - W_hist))
+  fut_rows <- lapply(scenarios, function(s)
+    keys %>%
+      left_join(fc_by_winter[[s]][[as.character(Wf)]] %>% mutate(match_key = Date_Time),
+                by = c("match_key", "Station")) %>%
+      distinct(row, .keep_all = TRUE))
+  ok <- Reduce(`&`, lapply(fut_rows, function(d)
+    complete.cases(d[, c("Date_Time", grep("^Han_", names(d), value = TRUE))])))
+  hk <- h[ok, ]
+  list(seg = make_seg(hk$ID, hk$roundT),                           # re-segment after dropped steps
+       u   = runif(nrow(hk)),                                      # common random numbers
+       X   = c(setNames(list(X_obs[hk$row, , drop = FALSE]), hist_label),
+               setNames(lapply(fut_rows, function(d) make_X(d[ok, ], cov_formula, beta_coeffs)), scenarios)))
+})
+
+# ---- Simulate every winter under each coefficient draw ----
+draws_seq <- beta_draws[seq_len(min(B_seq, length(beta_draws)))]
+sim_arr <- array(NA_real_, dim = c(length(metric_names), length(sim_levels), length(design), length(draws_seq)),
+                 dimnames = list(metric_names, sim_levels, NULL, NULL))   # metric x period x winter x draw
+for (k in seq_along(draws_seq)) {
+  b <- draws_seq[[k]]
+  for (j in seq_along(design)) {
+    d <- design[[j]]
+    sim_arr[, , j, k] <- sapply(sim_levels, function(p) seq_metrics(sim_states(d$X[[p]], b, d$seg, d$u), d$seg))
+  }
+}
+
+# Per-draw means over the design winters (metric x period x draw)
+draw_means <- apply(sim_arr, c(1, 2, 4), mean, na.rm = TRUE)
+```
+
+```{r}
+# Mean of each metric per period
+seq_means <- apply(draw_means, c(1, 2), mean)
+as_tibble(seq_means, rownames = "Metric") %>%
+  mutate(Metric = factor(Metric, levels = metric_names),
+         across(where(is.numeric), ~ round(.x, 3))) %>%
+  print(n = Inf, width = Inf)
+
+# SSP - historical, paired within each coefficient draw.
+# Diff_lo/Diff_hi = 95% interval across draws (parameter uncertainty of the mean effect);
+# P_increase = share of draws in which the SSP mean is higher than historical.
+# Metrics shown in the contrast table (bout frequency, bout length and gap length per state)
+table_metrics <- metric_names
+
+seq_contrasts <- bind_rows(lapply(scenarios, function(s) bind_rows(lapply(table_metrics, function(mt) {
+  dd <- draw_means[mt, s, ] - draw_means[mt, hist_label, ]
+  tibble(Metric     = factor(mt, levels = table_metrics),
+         Contrast   = paste(s, "- historical"),
+         Mean_diff  = mean(dd),
+         Diff_lo    = q(dd, .025),
+         Diff_hi    = q(dd, .975),
+         Rel_change = mean(dd) / seq_means[mt, hist_label])
+})))) %>% arrange(Metric)
+seq_contrasts %>% mutate(across(where(is.numeric), ~ round(.x, 3))) %>% print(n = Inf, width = Inf)
+```
+
+```{r sequence simulation plot, fig.width=3, fig.height=5}
+metric_labels <- c("Bouts per day | Foraging"      = "Foraging bouts per day",
+                   "Mean bout (h) | Foraging"      = "Mean foraging bout (h)",
+                   "Mean gap between foraging (h)" = "Mean gap between foraging (h)")
+
+# Per-draw means (each = average over all simulated future winters for one coefficient draw)
+seq_draws <- bind_rows(lapply(names(metric_labels), function(mt) bind_rows(lapply(sim_levels, function(p)
+  tibble(Metric = mt, Period = p, Value = draw_means[mt, p, ])))))  %>%
+  mutate(Metric = factor(metric_labels[Metric], levels = metric_labels),
+         Period = factor(Period, levels = period_levels))
+
+plot_seq <- ggplot(seq_draws, aes(x = Period, y = Value, fill = Period, colour = Period)) +
+  geom_violin(alpha = 0.4, trim = TRUE, linewidth = 0.6, adjust = 1.2) +
+  geom_jitter(width = 0.27, height = 0, size = 0.1, alpha = 0.4, shape = 16) +
+  stat_summary(fun = mean, fun.min = function(x) q(x, .025), fun.max = function(x) q(x, .975),
+               geom = "pointrange", colour = "grey10", size = 0.3) +
+  facet_wrap(~ Metric, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = period_fill, guide = "none") +
+  scale_colour_manual(values = period_col, guide = "none") +
+  labs(x = NULL, y = NULL,
+       caption = paste0("Violins = distribution over ", length(draws_seq), " coefficient draws, each averaging ",
+                        length(design), " simulated future winters\n(", min(fut_winters_ok), "/",
+                        min(fut_winters_ok) + 1, " to ", max(fut_winters_ok), "/", max(fut_winters_ok) + 1,
+                        "); point = mean, bar = 95% interval. Draws are paired across periods,\n",
+                        "so test differences with Diff_lo/Diff_hi in seq_contrasts, not violin overlap.")) +
+  scale_x_discrete(labels = function(x) sub(" (", "\n(", x, fixed = TRUE)) + theme_bw() +
+  theme(strip.text   = element_text(face = "bold", size = 8),
+        axis.text.x  = element_text(size = 8),
+        plot.caption = element_text(size = 5),
+        panel.grid.major.x = element_blank())
+print(plot_seq)
+#ggsave(paste0("/Users/yjkang/Desktop/sequence_foraging", out_tag, ".pdf"), plot = plot_seq, width = 3, height = 5)
+```
+
+```{r trajectory simulation}
+set.seed(010)
+# Historical tracking winter with the most steps, and the bird with the most steps in it.
+# Future climate = the same dates `horizon` years later.
+traj_W_hist <- as.integer(names(which.max(vapply(hist_w, nrow, integer(1)))))
+traj_W_fut  <- traj_W_hist + horizon
+stopifnot("traj_W_fut is outside the future covariates" = traj_W_fut %in% fut_winters_ok)
+
+h <- hist_w[[as.character(traj_W_hist)]]
+traj_id <- names(which.max(table(as.character(h$ID))))
+h <- h %>% filter(as.character(ID) == traj_id)                    # already ordered by time
+
+# Future covariates at the matched dates; usable steps = complete in every scenario
+keys <- h %>% transmute(row, Station, match_key = roundT + years(traj_W_fut - W_hist))
+fut_rows <- lapply(scenarios, function(s)
+  keys %>%
+    left_join(fc_by_winter[[s]][[as.character(traj_W_fut)]] %>% mutate(match_key = Date_Time),
+              by = c("match_key", "Station")) %>%
+    distinct(row, .keep_all = TRUE))
+ok <- Reduce(`&`, lapply(fut_rows, function(d)
+  complete.cases(d[, c("Date_Time", grep("^Han_", names(d), value = TRUE))])))
+
+# Keep only the longest unbroken run of hourly usable steps
+ok_idx    <- which(ok)
+seg_ok    <- make_seg(h$ID[ok_idx], h$roundT[ok_idx])             # new segment at every gap
+seg_len   <- tabulate(seg_ok)
+sel       <- ok_idx[seg_ok == which.max(seg_len)]                 # rows of h in the longest segment
+stopifnot(all(diff(as.numeric(h$roundT[sel])) == 3600))
+
+traj_start <- with_tz(min(h$roundT[sel]), "Asia/Seoul")
+traj_end   <- with_tz(max(h$roundT[sel]), "Asia/Seoul")
+traj_steps <- length(sel)
+
+# Covariates for simData: only the variables in the HMM formula
+fvars <- all.vars(hmm_model$conditions$formula)
+traj_covs <- c(setNames(list(hist_hangang_data[h$row[sel], fvars, drop = FALSE]), hist_label),
+               setNames(lapply(fut_rows, function(d) d[sel, fvars, drop = FALSE]), scenarios))
+stopifnot(!anyNA(bind_rows(traj_covs)))
+message("Bird ", traj_id, ": winter ", traj_W_hist, "/", traj_W_hist + 1, " tracking, ",
+        traj_W_fut, "/", traj_W_fut + 1, " climate; longest continuous segment of ",
+        length(seg_len), ": ", format(traj_start, "%Y-%m-%d %H:%M"), " to ",
+        format(traj_end, "%Y-%m-%d %H:%M"), " KST, ", traj_steps, " steps (",
+        round(traj_steps / 24, 1), " days)")
+
+# Simulate one continuous track per period (MLE parameters)
+traj_sim <- bind_rows(lapply(period_levels, function(p)
+  simData(model = hmm_model, covs = traj_covs[[p]], obsPerAnimal = nrow(traj_covs[[p]]), states = TRUE) %>%
+    as.data.frame() %>%
+    transmute(x, y, Behavior = factor(behav_levels[states], levels = behav_levels), Period = p))) %>%
+  mutate(Period = factor(Period, levels = period_levels))
+```
+
+```{r trajectory plot, fig.width=6, fig.height=6}
+g <- ggplot(traj_sim, aes(x = x, y = y)) +
+  geom_path(color = "dodgerblue3", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(color = Behavior), size = 0.8, alpha = 0.8, shape = 16) +
+  facet_wrap(~ Period, ncol = 2) + theme_minimal() +
+  coord_equal(xlim = c(-270, 250), ylim = c(-270, 210)) +
+  scale_color_manual(values = c("Traveling" = NA, "Foraging" = "orangered2", "Roosting" = "grey10")) +
+  labs(title = "Simulated Hangang Trajectories", x = "Easting (km)", y = "Northing (km)",
+       caption = paste0("One simulated winter per period (", traj_W_fut, "/", traj_W_fut + 1,
+                        " climate); illustrative only")) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(), plot.title = element_text(size = 17, hjust = 0.5),
+        strip.text = element_text(size = 13, face = "bold"),
+        panel.border = element_rect(color = "gray80", fill = NA, linewidth = 1), panel.spacing = unit(0.5, "lines"))
+print(g)
+#ggsave(paste0("/Users/yjkang/Desktop/sim_traj", out_tag, ".pdf"), plot = g, width = 6, height = 6)
+```
+
+```{r}
+library(gganimate)
+library(gifski)
+
+traj_anim <- traj_sim %>%
+  group_by(Period) %>%
+  mutate(step_n = row_number()) %>%
+  ungroup()
+
+g_anim <- ggplot(traj_anim, aes(x = x, y = y)) +
+  geom_path(color = "dodgerblue3", alpha = 0.7, linewidth = 0.5) +
+  geom_point(aes(color = Behavior, group = seq_along(step_n)),
+             size = 0.8, alpha = 0.8, shape = 16) +
+  facet_wrap(~ Period, ncol = 2) + theme_minimal() +
+  coord_equal(xlim = c(-270, 250), ylim = c(-270, 210)) +
+  scale_color_manual(values = c("Traveling" = NA, "Foraging" = "orangered2", "Roosting" = "grey10")) +
+  labs(title = "Simulated Hangang Trajectories",
+       subtitle = "Step: {round(frame_along)} / {max(traj_anim$step_n)}",
+       x = "Easting (km)", y = "Northing (km)",
+       caption = paste0("One simulated winter per period (", traj_W_fut, "/", traj_W_fut + 1,
+                        " climate); illustrative only")) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(), plot.title = element_text(size = 17, hjust = 0.5),
+        plot.subtitle = element_text(size = 13, hjust = 0.5),
+        strip.text = element_text(size = 13, face = "bold"),
+        panel.border = element_rect(color = "gray80", fill = NA, linewidth = 1),
+        panel.spacing = unit(0.5, "lines")) +
+  transition_reveal(step_n)
+
+anim <- animate(g_anim, nframes = 200, fps = 15, end_pause = 30,
+                width = 1000, height = 900, res = 120,
+                renderer = gifski_renderer())
+#anim_save("/Users/yjkang/Desktop/hangang_trajectories.gif", anim)
+```
+
+```{r}
+traj_dates <- tibble(
+  Hist_UTC = h$roundT[ok],
+  Fut_UTC  = keys$match_key[ok]
+) %>%
+  mutate(Hist_KST = with_tz(Hist_UTC, "Asia/Seoul"),
+         Fut_KST  = with_tz(Fut_UTC,  "Asia/Seoul"),
+         Seg      = cumsum(c(TRUE, diff(as.numeric(Hist_UTC)) != 3600)))   # new segment at every gap
+
+# 1. Overall span and coverage
+traj_dates %>%
+  summarise(Steps        = n(),
+            Sim_days     = n() / 24,
+            Hist_first   = min(Hist_KST), Hist_last = max(Hist_KST),
+            Fut_first    = min(Fut_KST),  Fut_last  = max(Fut_KST),
+            Calendar_span_days = as.numeric(difftime(max(Hist_UTC), min(Hist_UTC), units = "days")),
+            Distinct_KST_days  = n_distinct(as.Date(Hist_KST)),
+            Segments     = n_distinct(Seg)) %>%
+  print(width = Inf)
+
+# 2. Continuous segments (each one is collapsed onto the next by simData)
+traj_segs <- traj_dates %>%
+  group_by(Seg) %>%
+  summarise(Start_KST = min(Hist_KST), End_KST = max(Hist_KST),
+            Hours = n(), .groups = "drop") %>%
+  mutate(Gap_before_h = as.numeric(difftime(Start_KST, lag(End_KST), units = "hours")) - 1)
+print(traj_segs, n = Inf)
+
+# 3. Steps per KST calendar day (spot partially covered days)
+traj_dates %>% count(Date = as.Date(Hist_KST)) %>% filter(n < 24) %>% print(n = Inf)
+```
+
+
+=======================================
+Sensitivity check: cubic interpolation vs native resolution
+=======================================
+Native = daily Temp/Wind/water quality held constant over the day, and month SPI6.
+```{r interp sensitivity 1}
+native_files <- setNames(sub("30min", "native_daily", ssp_files), scenarios)
+stopifnot(all(file.exists(native_files)))
+
+prep_native_covs <- function(path) {
+  read.csv(path) %>%
+    mutate(Date = as.Date(Date)) %>%
+    arrange(Station, Date) %>%
+    # SPI6 is monthly and stored on the 1st of each month only:
+    # give every day of the month that month's value (step function over the month)
+    group_by(Station, Month = floor_date(Date, "month")) %>%
+    fill(SPI6, .direction = "downup") %>%
+    ungroup() %>%
+    { stopifnot("SPI6 still missing after fill" = !anyNA(.$SPI6)); . } %>%
+    filter(month(Date) %in% c(10, 11, 12, 1, 2, 3, 4)) %>%
+    # daily values held constant over the 48 half-hours of each KST day (step function over the day)
+    crossing(slot = 0:47) %>%
+    mutate(Date_Time  = with_tz(force_tz(as.POSIXct(Date), "Asia/Seoul") + slot * 1800, "UTC"),
+           In_Hangang = 1,
+           Han_Temp   = z_ref(Temperature.C.,   "Temp"),
+           Han_Wind   = z_ref(Wind_Speed.m.s.,  "Wind"),
+           Han_SPI6   = z_ref(SPI6,             "SPI6"),   # native monthly SPI6
+           Han_wTemp  = z_ref(Pred_Water_Temp,  "wTemp"),
+           Han_BOD    = z_ref(Pred_BOD,         "BOD"),
+           Han_DTN    = z_ref(Pred_DTN,         "DTN"),
+           Han_Chlor  = z_ref(Pred_Chlorophyll, "Chlor")) %>%
+    select(Station, Date_Time, In_Hangang, starts_with("Han_")) %>%
+    na.omit() %>%
+    distinct(Station, Date_Time, .keep_all = TRUE)
+}
+native_covs_list <- lapply(native_files, prep_native_covs)
+```
+
+```{r}
+## ---- A. Step-level stationary probabilities: interpolated vs native, same transferred steps ----
+has_covs <- function(d) complete.cases(d[, c("Date_Time", grep("^Han_", names(d), value = TRUE))])
+
+# Every historical step transferred into every retained future winter
+trans_all <- bind_rows(lapply(sort(unique(unlist(lapply(wt[scenarios], `[[`, "winters")))), function(Wf)
+  hrows %>% transmute(row, Station, W = Wf, match_key = roundT + years(Wf - W_hist)))) %>%
+  filter(!is.na(match_key))                                          # 29 Feb in non-leap target years
+
+join_covs <- function(keys, fc) keys %>%
+  left_join(fc %>% distinct(Station, Date_Time, .keep_all = TRUE) %>% mutate(match_key = Date_Time),
+            by = c("Station", "match_key"))
+
+# Stationary probabilities at the MLE, per transferred step, under both covariate versions
+sens_prob_tab <- bind_rows(lapply(scenarios, function(s) {
+  tr    <- trans_all %>% filter(W %in% wt[[s]]$winters)
+  keys  <- tr %>% distinct(Station, match_key) %>% mutate(k = row_number())
+  d_int <- join_covs(keys, future_covs_list[[s]])
+  d_nat <- join_covs(keys, native_covs_list[[s]])
+  ok_int <- has_covs(d_int); ok_nat <- has_covs(d_nat)
+  tr <- tr %>% left_join(keys, by = c("Station", "match_key")) %>% filter(ok_int[k])
+  stopifnot("steps without native covariates" = all(ok_nat[tr$k]))   # same step set as the main analysis
+  kk <- which(ok_int & ok_nat)
+  idx <- match(tr$k, kk)                                              # step -> unique future timestamp
+  Pi <- stationary_3state(make_X(d_int[kk, ], cov_formula, beta_coeffs), beta_coeffs)[idx, , drop = FALSE]
+  Pn <- stationary_3state(make_X(d_nat[kk, ], cov_formula, beta_coeffs), beta_coeffs)[idx, , drop = FALSE]
+  colnames(Pi) <- colnames(Pn) <- behav_levels
+  bind_rows(lapply(behav_levels, function(bh) { x <- Pi[, bh]; y <- Pn[, bh]
+    tibble(Scenario = s, Behavior = bh, N_steps = length(x), Mean_interp = mean(x), Mean_native = mean(y),
+           Diff = mean(y) - mean(x), MAE_step = mean(abs(x - y)), RMSE_step = sqrt(mean((x - y)^2)),
+           r = cor(x, y))
+  }))
+}))
+print(sens_prob_tab, n = Inf)
+```
+
+```{r}
+ ## ---- B. Simulated bout metrics: interpolated vs native ----
+has_covs <- function(d) complete.cases(d[, c("Date_Time", grep("^Han_", names(d), value = TRUE))])
+nat_by_winter <- lapply(native_covs_list, function(fc) split(fc, winter_of(fc$Date_Time)))
+get_w <- function(lst, Wf) { x <- lst[[as.character(Wf)]]; if (is.null(x)) lst[[1]][0, ] else x }
+
+design_sens <- lapply(seq_along(fut_winters_ok), function(j) {
+  h  <- hist_w[[h_order[j]]]
+  Wf <- fut_winters_ok[j]
+  keys <- h %>% transmute(row, Station, match_key = roundT + years(Wf - W_hist))
+  join_w <- function(fc_w) keys %>%
+    left_join(fc_w %>% mutate(match_key = Date_Time), by = c("match_key", "Station")) %>%
+    distinct(row, .keep_all = TRUE)
+  int_rows <- lapply(scenarios, function(s) join_w(get_w(fc_by_winter[[s]], Wf)))
+  nat_rows <- lapply(scenarios, function(s) join_w(get_w(nat_by_winter[[s]], Wf)))
+  ok_int <- Reduce(`&`, lapply(int_rows, has_covs))           # = the main design's steps
+  ok_nat <- Reduce(`&`, lapply(nat_rows, has_covs))
+  stopifnot(sum(ok_int) == length(design[[j]]$u))
+  ok <- ok_int & ok_nat
+  hk <- h[ok, ]
+  mk <- function(rows) lapply(rows, function(d) make_X(d[ok, ], cov_formula, beta_coeffs))
+  list(seg       = make_seg(hk$ID, hk$roundT),
+       u         = design[[j]]$u[ok[ok_int]],                 # same random numbers as the main run
+       n_dropped = sum(ok_int & !ok_nat),
+       X = c(setNames(list(X_obs[hk$row, , drop = FALSE]), hist_label),
+             setNames(mk(int_rows), paste(scenarios, "| int")),
+             setNames(mk(nat_rows), paste(scenarios, "| nat"))))
+})
+n_drop <- sapply(design_sens, `[[`, "n_dropped")
+cat("Main-design steps without native covariates:", sum(n_drop), "\n")
+
+sens_levels <- names(design_sens[[1]]$X)
+sens_arr <- array(NA_real_, dim = c(length(metric_names), length(sens_levels), length(design_sens), length(draws_seq)),
+                  dimnames = list(metric_names, sens_levels, NULL, NULL))
+for (k in seq_along(draws_seq)) {
+  b <- draws_seq[[k]]
+  for (j in seq_along(design_sens)) {
+    d <- design_sens[[j]]
+    sens_arr[, , j, k] <- sapply(sens_levels, function(p) seq_metrics(sim_states(d$X[[p]], b, d$seg, d$u), d$seg))
+  }
+}
+sens_draw_means <- apply(sens_arr, c(1, 2, 4), mean, na.rm = TRUE)
+
+# TRUE = the interpolated side reproduces the main simulation (only when no steps were dropped)
+if (all(n_drop == 0))
+  print(all.equal(unname(sens_draw_means[, c(hist_label, paste(scenarios, "| int")), ]), unname(draw_means)))
+
+# SSP - historical contrast under each covariate version (mean over draws), and native - interpolated
+# Bouts per day, mean bout and mean gap between bouts, for each state
+cmp_metrics <- metric_names
+seq_cmp <- bind_rows(lapply(scenarios, function(s) bind_rows(lapply(cmp_metrics, function(mt) {
+  h  <- sens_draw_means[mt, hist_label, ]
+  di <- sens_draw_means[mt, paste(s, "| int"), ] - h
+  dn <- sens_draw_means[mt, paste(s, "| nat"), ] - h
+  tibble(Metric        = factor(mt, levels = cmp_metrics),
+         Contrast      = paste(s, "- historical"),
+         Diff_int      = mean(di),
+         Diff_nat      = mean(dn),
+         Nat_minus_int = mean(dn - di))
+})))) %>% arrange(Metric)
+seq_cmp %>% mutate(across(where(is.numeric), ~ round(.x, 3))) %>% print(n = Inf, width = Inf)
+```
+
+
+
+
+
+
+
+

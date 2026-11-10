@@ -1,0 +1,475 @@
+---
+title: "BigData_Wetland_migratoryBirds"
+author: "Youn Jae Kang"
+date: "2026-03-23"
+output: html_document
+---
+
+```{r load package, message=FALSE}
+library(picante)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(readxl)
+library(rotl)     
+library(ape)
+```
+
+
+```{r setup_data}
+df <- read_excel("/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/Wetland_birds_combined_2006_2023.xlsx")
+valid_wetlands <- c('고창 운곡습지', '낙동강하구', '담양하천습지', '대암산 용늪', '두웅습지', '무제치늪',
+                    '양산 능걸산 산지습지', '영월 한반도습지', '우포늪', '제주 1100고지',
+                    '제주 물장오리오름', '한강하구', '화엄늪')
+df <- df %>% filter(Wetland_Name %in% valid_wetlands)
+table(df$Wetland_Name, df$Year)
+```
+
+```{r}
+wetland_names_en <- c(
+  '고창 운곡습지' = 'Gochang Ungok', 
+  '낙동강하구' = 'Nakdonggang', 
+  '담양하천습지' = 'Damyang',
+  '대암산 용늪' = 'Dae-amsan Yongneup', 
+  '두웅습지' = 'Du-ung', 
+  '무제치늪' = 'Mujechi',
+  '양산 능걸산 산지습지' = 'Yangsan Neunggeolsan',
+  '영월 한반도습지' = 'Yeongwol Hanbando', 
+  '우포늪' = 'Upo', 
+  '제주 1100고지' = 'Jeju 1100 Altitude',
+  '제주 물장오리오름' = 'Jeju Muljangori', 
+  '한강하구' = 'Hangang', 
+  '화엄늪' = 'Hwa-eomneup')
+
+wetland_order <- c(
+  "Mujechi", "Hangang", "Nakdonggang", "Damyang", "Hwa-eomneup", "Du-ung", "Yeongwol Hanbando", 
+  "Jeju Muljangori", "Jeju 1100 Altitude", "Upo", "Gochang Ungok", "Yangsan Neunggeolsan", "Dae-amsan Yongneup")             
+```
+
+==========================================
+Bird Phylogenetic Tree 
+==========================================
+```{r}
+library(phangorn)
+# MCC tree built once from the BirdTree.org Hackett-backbone posterior (Jetz et al. 2012):
+#trees <- read.tree("/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/Wetland_2006_2023/AllBirdsHackett1.tre")
+#mcc_tree <- maxCladeCred(trees)
+#write.tree(mcc_tree, file = "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/Wetland_2006_2023/bird_tree.tre")
+my_tree <- read.tree("/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/bird_tree.tre")
+```
+
+```{r taxonomy}
+# Harmonise survey names to BirdTree (Jetz et al. 2012) taxonomy.
+# Genus changes / spelling: one-to-one renames.
+# Lumps: BirdTree treats these as one species, so both survey taxa map to a single tip.
+birdtree_syn <- c(
+  "Ardea alba"              = "Casmerodius albus",       # genus
+  "Cecropis daurica"        = "Hirundo daurica",         # genus
+  "Egretta intermedia"      = "Mesophoyx intermedia",    # genus
+  "Luscinia cyanura"        = "Tarsiger cyanurus",       # genus
+  "Microscelis amaurotis"   = "Ixos amaurotis",          # genus
+  "Tetrastes bonasia"       = "Bonasa bonasia",          # genus
+  "Larus cachinans"         = "Larus cachinnans",        # typo in survey data
+  "Pernis ptilorhynchus"    = "Pernis ptilorhyncus",     # BirdTree spelling
+  "Motacilla alba lugens"   = "Motacilla alba",          # subspecies -> species
+  "Acrocephalus orientalis" = "Acrocephalus stentoreus", # lump
+  "Cuculus hyperythrus"     = "Cuculus fugax",           # lump
+  "Turdus eunomus"          = "Turdus naumanni",         # lump
+  "Zoothera aurea"          = "Zoothera dauma")          # lump
+
+df <- df %>%
+  mutate(Scientific_Name = trimws(Scientific_Name),
+         Tree_Name = gsub(" ", "_", dplyr::recode(Scientific_Name, !!!birdtree_syn)))
+
+# Every survey taxon must now be a tip in the tree; stop rather than drop silently.
+unmatched <- setdiff(unique(df$Tree_Name), my_tree$tip.label)
+if (length(unmatched) > 0) stop("Not in BirdTree: ", paste(unmatched, collapse = ", "))
+```
+
+```{r community_matrix}
+# Community matrix: rows = Site_Year (one survey), cols = species, values = presence/absence.
+# Lumps can put two survey taxa into one tip within the same survey, so binarise after renaming.
+comm_matrix <- as.data.frame.matrix(
+  table(paste(df$Wetland_Name, df$Year, sep = "_"), df$Tree_Name))
+comm_matrix[comm_matrix > 0] <- 1
+
+# Prune tree to the regional pool (all species recorded across the 13 wetlands).
+matched_data <- match.phylo.comm(my_tree, comm_matrix)
+clean_tree <- matched_data$phy
+clean_comm_matrix <- matched_data$comm
+stopifnot(ncol(clean_comm_matrix) == ncol(comm_matrix))   # nothing dropped
+
+# Pairwise phylogenetic distance = summed branch length between tips
+# (~ 2 x divergence time in Myr on this time-calibrated tree).
+phylo_dist_matrix <- cophenetic(clean_tree)
+```
+
+==========================================
+THE 999-ITERATION NULL MODELS for SES. MPD
+==========================================
+```{r}
+#Running 999-iteration Null Model for Avian SES.MPD...\n
+set.seed(2026)
+ses_mpd_out <- ses.mpd(clean_comm_matrix, phylo_dist_matrix, null.model = "taxa.labels", abundance.weighted = FALSE, runs = 999)
+ses_mpd_df <- ses_mpd_out %>%
+     tibble::rownames_to_column("Site_Year") %>%
+     mutate(Wetland_KR = sub("_[0-9]{4}$", "", Site_Year),
+            Year       = as.integer(sub("^.*_", "", Site_Year)),
+            Wetland    = wetland_names_en[Wetland_KR],
+            SES_MPD    = mpd.obs.z)
+ses_mpd_df
+```
+
+==========================================
+Attaching Climate factors ~ Wetland diversity 
+==========================================
+```{r}
+birds_df <- ses_mpd_df #read_csv("/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/bird_phylo_traj.csv", show_col_types = FALSE)
+occ_df <- read_excel("/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/Wetland_Species_Occurrence_Invasive_2006_2024.xlsx")
+
+# Extract unique coordinates per wetland (assuming Korean Names are in '습지명')
+coords_df <- occ_df %>%
+  rename(Year = 조사년도, Wetland_KR = 습지명) %>%
+  select(Wetland_KR, Latitude, Longitude) %>%
+  filter(!is.na(Latitude), !is.na(Longitude)) %>%
+  distinct(Wetland_KR, .keep_all = TRUE)
+
+# Map Korean prefix from 'Site_Year' in phylo data to match coords
+birds_df <- birds_df %>%
+  mutate(Wetland_KR = sapply(strsplit(as.character(Site_Year), "_"), `[`, 1)) %>%
+  left_join(coords_df, by = "Wetland_KR")
+```
+
+```{r}
+#combine climate variables and species diversity
+library(ncdf4)
+
+nc_files <- list(
+  "Annual Precipitation (mm)" = "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/강수량_MKPRISMv21_skorea_RN_gridraw_yearly_2000_2019.nc",
+  "Maximum Dry Spell Length (days)" = "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/최대무강수지속기간_MKPRISMv21_skorea_CDD_gridraw_yearly_2000_2019.nc",
+  "Heatwave Days (days)" = "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/폭염일수_MKPRISMv21_skorea_HW33_gridraw_yearly_2000_2019.nc",
+  "Average Wind Speed (m/s)" = "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/풍속_MKPRISMv21_skorea_WS_gridraw_yearly_2000_2019.nc",
+  "Coldwave Days (days)" = "/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/한파일수_MKPRISMv21_skorea_CWm12_gridraw_yearly_2000_2019.nc"
+)
+
+extract_climate_data <- function(df, max_radius = 15) {
+  # Define the fill value used in MK-PRISM (usually -9990)
+  FILL_VALUE_THRESHOLD <- -9000 
+
+  for (var_name in names(nc_files)) {
+    filename <- nc_files[[var_name]]
+    df[[var_name]] <- NA
+    
+    if (!file.exists(filename)) {
+      message(paste("File not found, skipping:", filename))
+      next
+    }
+
+    nc_data <- nc_open(filename)
+    lats <- ncvar_get(nc_data, "latitude")
+    lons <- ncvar_get(nc_data, "longitude")
+    var_id <- names(nc_data$var)[1] 
+    
+    time_units <- ncatt_get(nc_data, "time", "units")$value
+    base_year <- ifelse(grepl("2014", time_units), 2014, 2000)
+    
+    message(paste("Extracting variable:", var_name))
+
+    for (i in 1:nrow(df)) {
+      target_lat <- df$Latitude[i]
+      target_lon <- df$Longitude[i]
+      target_year <- df$Year[i]
+      
+      if (is.na(target_lat) || is.na(target_lon) || is.na(target_year)) next
+      
+      # 1. Find the initial mathematically closest pixel
+      lat_idx <- which.min(abs(lats - target_lat))
+      lon_idx <- which.min(abs(lons - target_lon))
+      time_idx <- (target_year - base_year) + 1
+
+      # Ensure year is within NetCDF bounds
+      if (time_idx >= 1 && time_idx <= nc_data$dim$time$len) {
+        
+        found_valid <- FALSE
+        
+        # 2. Start Buffered Search (Radius 0 to max_radius)
+        # Radius 0 is the exact point. Radius 1 is a 3x3 grid, etc.
+        for (r in 0:max_radius) {
+          # Define window boundaries
+          start_lon <- max(1, lon_idx - r)
+          start_lat <- max(1, lat_idx - r)
+          # Determine width/height of the window
+          count_lon <- min(nc_data$dim$longitude$len - start_lon + 1, (2 * r) + 1)
+          count_lat <- min(nc_data$dim$latitude$len - start_lat + 1, (2 * r) + 1)
+          # Extract the window/block for that specific time index
+          window_data <- ncvar_get(nc_data, varid = var_id, 
+                                   start = c(start_lon, start_lat, time_idx), 
+                                   count = c(count_lon, count_lat, 1))
+          # Filter for valid land values (ignoring fill values like -9990)
+          valid_values <- window_data[window_data > FILL_VALUE_THRESHOLD]
+          if (length(valid_values) > 0) {
+            # Use the average of valid points found at the closest possible radius
+            df[[var_name]][i] <- mean(valid_values, na.rm = TRUE)
+            found_valid <- TRUE
+            break # Exit the radius loop once data is found
+          }
+        }
+        if (!found_valid) {
+          message(paste("No valid land data within", max_radius, "pixels for:", df$Wetland_KR[i], "in", target_year))
+        }
+      }
+    }
+    nc_close(nc_data)
+  }
+  return(df)
+}
+
+# Run the extraction (this might take a few moments depending on dataset size)
+birds_final <- extract_climate_data(birds_df)
+# Drop temporary merge column
+birds_final <- birds_final %>% select(-Wetland_KR)
+
+# Export curated files
+#write_csv(birds_final, "bird_phylo_traj_climate_fullnames_R.csv")
+```
+
+==========================================
+Climate factors ~ Wetland diversity 
+==========================================
+```{r, fig.width=10, fig.height=7}
+library(car)
+library(corrplot)
+
+birds_df <- read_csv("/Users/yjkang/Desktop/EAAF_HMM/DataAvailability/Zenodo/01_wetland_Avian_diversity/Wetland13_Bird_climate_waterChem_biomonitor.csv")
+climate_vars <- c(
+  "Annual.Precipitation..mm.", #"Annual Precipitation (mm)",
+  "Maximum.Dry.Spell.Length..days.", #"Maximum Dry Spell Length (days)",
+  "Heatwave.Days..days.", #"Heatwave Days (days)",
+  "Average.Wind.Speed..m.s.", #"Average Wind Speed (m/s)",
+  "Coldwave.Days..days.", #"Coldwave Days (days)",
+  "Mean_Water_Temp",	
+  "Mean_pH",	
+  "Spring_Mean_DTN",
+  "Mean_BOD",	
+  "Summer_Min_DO"	 )
+
+# Prepare the data matrix (drop rows with missing values)
+climate_data <- birds_df %>%
+  select(all_of(climate_vars)) %>%
+  na.omit()
+
+# Correlation Matrix
+cor_matrix <- cor(climate_data)
+#print(round(cor_matrix, 2))
+
+#pdf(file = "/Users/yjkang/Desktop/corr_linearmixed.pdf", width = 10, height = 7)
+corrplot(cor_matrix, method = "color", type = "upper", 
+         addCoef.col = "black", # Add correlation coefficients to the plot
+         tl.col = "black", tl.srt = 45, # Text label color and rotation
+         number.cex = 1, # Size of the numbers
+         diag = TRUE) # Don't show the 1.0 correlation on the diagonal
+#dev.off()
+```
+
+
+```{r, message=FALSE}
+library(lme4)
+library(lmerTest)
+library(car)
+library(nlme)   # lme() with within-site temporal correlation (corCAR1)
+
+rename_map <- c(
+  "sDTN" = "Spring_Mean_DTN",
+  "AP" = "Annual.Precipitation..mm.", 
+  "Dry" = "Maximum.Dry.Spell.Length..days.", 
+  "Heatw" = "Heatwave.Days..days.", #"Heatwave Days (days)",
+  "WS" = "Average.Wind.Speed..m.s.", #"Average Wind Speed (m/s)",
+  "Coldw" = "Coldwave.Days..days.", #"Coldwave Days (days)",
+  "WTemp" = "Mean_Water_Temp",	
+  "pH" = "Mean_pH",	
+  "BOD" = "Mean_BOD",	
+  "sDO" = "Summer_Min_DO"	)
+
+#Filtering out dropped vars, omitting NAs, and scaling
+vars_to_keep <- names(rename_map)
+
+prepare_data <- function(df) {
+  df %>%
+    rename(any_of(rename_map)) %>%
+    select(SES_MPD, Wetland, Year, all_of(vars_to_keep)) %>%   # keep Year for the temporal correlation
+    filter(complete.cases(.)) %>%  # Drop rows with NA values
+    mutate(Year    = as.numeric(Year),                         # corCAR1 needs numeric time
+           Wetland = factor(Wetland),
+           across(all_of(vars_to_keep), ~ as.numeric(scale(.x)))) # Z-score as plain numeric (scale() returns a matrix, which nlme handles poorly)
+}
+
+birds_clean <- prepare_data(birds_df)
+
+# corCAR1 requires one observation per Wetland x Year (one survey = one row)
+stopifnot(!any(duplicated(birds_clean[c("Wetland", "Year")])))
+
+cat("\n=== Checking VIF for the 7 Variables ===\n")
+vif_model <- lm(SES_MPD ~ sDTN+ AP+ Dry + Heatw + WS + Coldw + WTemp + pH + BOD + sDO, data = birds_clean) 
+print(car::vif(vif_model))
+# Note: Variables with a VIF > 5 are highly collinear and should be dropped before running Mixed-Effects Model
+```
+
+```{r}
+# main model (wetland random intercept only):
+orig_bird_lmm <- lmer(SES_MPD ~ sDTN+ AP+ Dry + Heatw + WS + Coldw + WTemp + pH + BOD + sDO + (1 | Wetland), data = birds_clean)
+
+# siteXtime correlation check
+bird_lmm <- lme(SES_MPD ~ sDTN + AP + Dry + Heatw + WS + Coldw + WTemp + pH + BOD + sDO,
+                random      = ~ 1 | Wetland,
+                correlation = corCAR1(form = ~ Year | Wetland),
+                data        = birds_clean,
+                method      = "REML")
+print(summary(orig_bird_lmm))   # Phi under "Correlation Structure" = correlation between surveys 1 year apart
+
+# For the reviewer response: same model without temporal correlation, fitted in nlme so AICs are comparable
+bird_lmm0 <- lme(SES_MPD ~ sDTN + AP + Dry + Heatw + WS + Coldw + WTemp + pH + BOD + sDO,
+                 random = ~ 1 | Wetland, data = birds_clean, method = "REML")
+print(AIC(bird_lmm0, bird_lmm))
+```
+
+```{r}
+cat("\n=== Supporting results: corCAR1 vs random-intercept model ===\n")
+
+# 1. Estimated Phi and the correlation it implies at the revisit gaps in the model data
+phi <- coef(bird_lmm$modelStruct$corStruct, unconstrained = FALSE)
+gaps <- birds_clean %>%
+  arrange(Wetland, Year) %>%
+  group_by(Wetland) %>%
+  mutate(gap = Year - lag(Year)) %>%
+  filter(!is.na(gap)) %>%
+  pull(gap)
+gap_tab <- as.data.frame(table(gap_years = gaps)) %>%
+  mutate(gap_years    = as.numeric(as.character(gap_years)),
+         implied_corr = phi^gap_years) %>%
+  rename(n_revisits = Freq)
+cat(sprintf("\nPhi (correlation between surveys 1 year apart) = %.4f\n", phi))
+cat("Implied residual correlation at the observed revisit gaps:\n")
+print(gap_tab, digits = 3)
+
+# 2. Log-likelihood and AIC
+ll0 <- logLik(bird_lmm0); ll1 <- logLik(bird_lmm)
+cat("\nModel fit:\n")
+print(data.frame(model  = c("Random intercept", "Random intercept + corCAR1"),
+                 n_par  = c(attr(ll0, "df"), attr(ll1, "df")),
+                 logLik = round(c(ll0, ll1), 3),
+                 AIC    = round(c(AIC(bird_lmm0), AIC(bird_lmm)), 3)))
+
+# 3. Fixed effects side by side: original lmer model vs corCAR1 model
+tt_ri  <- summary(orig_bird_lmm)$coefficients   # lmerTest table
+tt_car <- summary(bird_lmm)$tTable              # nlme table
+comp <- data.frame(Est_RI  = tt_ri[, "Estimate"],   Est_CAR1 = tt_car[, "Value"],
+                   SE_RI   = tt_ri[, "Std. Error"], SE_CAR1  = tt_car[, "Std.Error"],
+                   t_RI    = tt_ri[, "t value"],    t_CAR1   = tt_car[, "t-value"])
+cat("\nFixed effects (RI = random intercept, CAR1 = + corCAR1):\n")
+print(round(comp, 4))
+
+# 4. Largest absolute differences between the two models
+cat(sprintf("\nMax |difference|: estimate = %.1e, SE = %.1e, t = %.1e\n",
+            max(abs(comp$Est_RI - comp$Est_CAR1)),
+            max(abs(comp$SE_RI  - comp$SE_CAR1)),
+            max(abs(comp$t_RI   - comp$t_CAR1))))
+```
+
+```{r, fig.width= 8.7, fig.height=4.1, message=FALSE}
+library(tidyr)
+library(ggpubr)
+library(ggpmisc)
+
+rename_map <- c(
+  "Annual Precip (mm)" = "Annual.Precipitation..mm.", 
+  "Max Dry Spell (days)" = "Maximum.Dry.Spell.Length..days.", 
+  "Heatwaves (days)" = "Heatwave.Days..days.", #"Heatwave Days (days)",
+  "Coldwaves (days)" = "Coldwave.Days..days.", #"Coldwave Days (days)",
+  "Wind Speed (m/s)" = "Average.Wind.Speed..m.s.", #"Average Wind Speed (m/s)",
+  "Water Temp (°C)" = "Mean_Water_Temp",	
+  "Mean Water pH" = "Mean_pH",	
+  "BOD (mg/L)" = "Mean_BOD",	
+  "Summer DO (mg/L)" = "Summer_Min_DO",
+  "Spring DTN (mg/L)" = "Spring_Mean_DTN" )
+long_names<- names(rename_map)
+
+plot_climate_correlations <- function(df, title_prefix, point_color) {
+  
+  df_clean <- df %>%
+    rename(any_of(rename_map)) %>%
+    select(SES_MPD, all_of(long_names)) %>%
+    filter(complete.cases(.)) %>%
+    # Pivot the data into a "long" format, which is required for ggplot faceting
+    pivot_longer(cols = all_of(long_names), 
+                 names_to = "Climate_Variable", 
+                 values_to = "Value")
+    #df_clean$Climate_Variable <- factor(df_clean$Climate_Variable, levels = long_names)
+    df_clean$Climate_Variable <- gsub(" \\(", "\n\\(", df_clean$Climate_Variable)
+    wrapped_levels <- gsub(" \\(", "\n\\(", long_names)
+    df_clean$Climate_Variable <- factor(df_clean$Climate_Variable, levels = wrapped_levels)
+  
+  p <- ggplot(df_clean, aes(x = Value, y = SES_MPD)) +
+    geom_point(color = point_color, alpha = 0.7, size = 1) +
+    geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 0.5) +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.05))) +
+    stat_correlation(use_label("R", "R.CI"), size=2.5) +
+    #stat_cor(method = "pearson", label.x.npc = 0.02, label.y.npc = 0, size = 3.7) + 
+    facet_wrap(~ Climate_Variable, scales = "free_x", ncol = 5, 
+               labeller = label_wrap_gen(width = 22)) +
+    coord_cartesian(clip = "off")+
+    labs(
+      title = paste("Potential Environmental Drivers of Wetland", title_prefix ,"Diversity"),
+      x = NULL,
+      y = "Phylogenetic Diversity (SES-MPD)"
+    ) +
+    theme_bw() + # Clean white background theme
+    theme(
+      plot.title = element_text(size = 15, hjust = 0.5, margin = margin(b = 10)),
+      strip.text = element_text(size = 11, face = "bold"),
+      axis.title = element_text(size = 13),
+      panel.grid.minor = element_blank()
+    )
+  return(p) }
+
+bird_plot <- plot_climate_correlations(birds_df, "Bird", "dodgerblue3")
+print(bird_plot)
+#ggsave("/Users/yjkang/Desktop/Bird_Climate_Correlations.pdf", plot = bird_plot, width = 8.7, height = 4.1)
+```
+
+```{r, fig.height=4, fig.width=5}
+library(sf)
+library(rnaturalearth)
+library(viridis)
+
+korea_map <- ne_states(country = "south korea", returnclass = "sf")
+
+plants_clean_spatial <- birds_df %>%
+  filter(!is.na(Longitude) & !is.na(Latitude))
+plants_sf <- st_as_sf(plants_clean_spatial, coords = c("Longitude", "Latitude"), crs = 4326)
+plants_mean_sf <- plants_sf %>%
+  group_by(Wetland) %>%
+  summarize(mean_SES_MPD = mean(SES_MPD, na.rm = TRUE))
+
+p<-ggplot() +
+  # Draw the base map of Korea in light grey
+  geom_sf(data = korea_map, fill = "gray95", color = "gray50") +
+  # Plot the wetlands, coloring them by Phylogenetic Diversity (SES_MPD)
+  geom_sf(data = plants_mean_sf, aes(size = mean_SES_MPD), shape = 21,
+          alpha = 0.8, fill = "dodgerblue3",color='white', stroke=0.5) +  # stroke=Thickness of the white outline
+  theme_minimal() +
+  labs(title = "Stopover wetland hubs on South Korean peninsula") +
+  theme(plot.title = element_text(size = 12, hjust = 0.5, margin = margin(b = 10)),
+        strip.text = element_text(size = 10, face = "bold") ) +
+  scale_size_continuous(
+    name = "Avian Diversity\n(SES-MPD)", 
+    breaks = c(-3, 0, 3),                     # Which values to show
+    labels = c("Clustered", "Balanced", "Diverse"), 
+    limits = c(-5, 3), range = c(1,6)         # Adjust the min/max circle size
+  ) 
+print(p)
+#ggsave("/Users/yjkang/Desktop/Bird_divers_map.pdf", plot = p, width = 5, height = 4)
+```
+
+
+

@@ -1,0 +1,331 @@
+---
+title: "BigData_Wetland_migratoryBirds"
+author: "Youn Jae Kang"
+date: "2026-03-25"
+output: html_document
+---
+
+What factor of a wetland affects migratory birds? and if the factor changes in the future, how will behaviour change?
+
+```{r load package, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(readr)
+library(readxl)
+library(lubridate)
+```
+
+=============================================================
+GPS clean-up
+=============================================================
+All times from here on are UTC. Each raw GPS file is read in the clock it was written in:
+GrusVipio_GPS.csv (br22063, br22064, br23011, br23018) is in Korean local time (KST, no daylight saving);
+the Movebank file for 27233947 (White_naped_crane_Mongolia_WSCC) is in UTC.
+```{r}
+gps_clock_tz <- "Asia/Seoul"   # GrusVipio_GPS.csv. Set "UTC" when this script is run on the WSCC/Movebank file.
+
+crane_data <- read.csv("/Users/yjkang/Desktop/NIE_BigData/Grus_Vipio/GrusVipio_GPS.csv", check.names = FALSE)
+crane_data$timestamp_clean <- with_tz(as.POSIXct(crane_data$Datetime, format = "%Y-%m-%d %H:%M:%S",
+                                                 tz = gps_clock_tz), "UTC")
+crane_data
+
+# Drop missing coordinates and keep points where HDOP is <= 5 
+# (we also keep NAs just in case the logger dropped the HDOP value but kept a valid 3D fix)
+clean_hdop <- subset(crane_data, !is.na(`latitude`) & !is.na(`longitude`))
+clean_hdop <- subset(clean_hdop, `GPS_DOP` <= 5 | is.na(`GPS_DOP`))
+clean_hdop
+```
+
+```{r}
+library(argosfilter)
+speed_threshold_ms <- 80 * (1000 / 3600) #biological speed threshold (80 km/h converted to m/s)
+
+# split the dataframe by individual, sort by time, apply the mask, and recombine.
+clean_pkg_list <- lapply(split(clean_hdop, clean_hdop$`ID`), function(bird_data) {
+  
+  # Sort chronologically
+  bird_data <- bird_data[order(bird_data$timestamp_clean), ]
+  bird_data <- bird_data[!duplicated(bird_data$timestamp_clean), ]
+  # Run the argosfilter velocity mask
+  filter_flags <- vmask(lat = bird_data$`latitude`, 
+                        lon = bird_data$`longitude`, 
+                        dtime = bird_data$timestamp_clean, 
+                        vmax = speed_threshold_ms)
+  return(bird_data[filter_flags %in% c("not", "end_location"), ])
+})
+
+final_clean_data <- do.call(rbind, clean_pkg_list)
+print(paste("Original points:", nrow(crane_data)))
+print(paste("Cleaned points:", nrow(final_clean_data)))
+final_clean_data
+
+#repeat for White_naped_crane_Mongolia_WSCC.csv
+#write.csv(final_clean_data, "/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/birdGPStrajectory/cleaned_White_naped_crane_Mongolia_WSCC.csv", row.names = FALSE)
+```
+
+```{r}
+#final_clean_data <- read_csv("/Users/yjkang/Desktop/NIE_BigData/wetland_birds/data/birdGPStrajectory/cleaned_White_naped_crane_Mongolia_WSCC.csv", show_col_types = FALSE)
+```
+
+=============================================================
+GPS to continuous time-series
+=============================================================
+```{r}
+#convert lat/lon to UTM (meters), mathematically flatten the map using a projection.
+#For Mongolia/China (around Longitude 110°E), UTM Zone 49N is the standard projection.
+library(sf)
+# 1. Convert Long/Lat to a spatial object (WGS84 = EPSG 4326)
+hmm_sf <- st_as_sf(final_clean_data, 
+                   coords = c("longitude", "latitude"), 
+                   crs = 4326) 
+
+# 2. Project the coordinates to meters (UTM Zone 49N = EPSG 32649)
+hmm_sf_proj <- st_transform(hmm_sf, crs = 32649)
+coords_proj <- st_coordinates(hmm_sf_proj) # Extract the new metric coordinates back out
+
+# Format the data for momentuHMM. columns specifically named "ID", "time", "x", "y"
+hmm_data <- data.frame(
+  ID = final_clean_data$`ID`,
+  time = final_clean_data$timestamp_clean,
+  x = coords_proj[, "X"], # Now in exact meters!
+  y = coords_proj[, "Y"]  # Now in exact meters!
+)
+hmm_data <- hmm_data[hmm_data$ID %in% c("br22063", "br22064", "br23018", "br23011"), ] #eastMongolian population
+hmm_data <- hmm_data[order(hmm_data$ID, hmm_data$time), ] #Ensure data is strictly ordered by ID and Time.
+hmm_data
+```
+
+#Test if there are problematic data gaps, etc.
+```{r, fig.height=4, fig.width=3}
+bad_bird <- hmm_data[hmm_data$ID == "br23011", ]
+
+print(nrow(bad_bird)) #Count total rows (Is it too sparse? < 50 points?)
+print(sum(duplicated(bad_bird$time)))  #Look for duplicate timestamps. if this number is > 0, crawlWrap will automatically fail.
+time_diffs <- diff(bad_bird$time)
+print(max(time_diffs)) # Are there gaps of weeks/months?
+```
+
+```{r}
+#dealing with massive time gaps
+gap_threshold <-24 * 60  # 7 days = 7 * 24 * 60 = 10080 minutes
+
+# split tracks with massive gaps
+hmm_data_fixed <- hmm_data %>%
+  group_by(ID) %>%
+  arrange(time, .by_group = TRUE) %>%
+  mutate(
+    time_diff = as.numeric(difftime(time, lag(time), units = "mins")),
+    # The first point has no previous point, so set to 0
+    time_diff = ifelse(is.na(time_diff), 0, time_diff),
+    # Flag any step that jumps by more than threshold (1) or not (0)
+    gap_flag = ifelse(time_diff > gap_threshold, 1, 0),
+    # Create a cumulative sum for the burst.  Example: 0, 0, 0, (gap!), 1, 1, 1, (gap!), 2, 2...
+    burst_num = cumsum(gap_flag) + 1,
+    # Create a temporary new ID column to avoid grouping conflicts
+    temp_ID = paste0(ID, "_", burst_num)
+  ) %>%
+  ungroup() %>%
+  # Safely overwrite the main ID column AFTER ungrouping
+  mutate(ID = temp_ID) %>%
+  # Drop the temporary columns to keep things clean
+  select(-time_diff, -gap_flag, -burst_num, -temp_ID)
+
+# for the gap, it would have created separate IDs "27233947_1","27233947_2"
+print(unique(hmm_data_fixed$ID[grepl("br23011", hmm_data_fixed$ID)]))
+```
+
+```{r}
+bird_subset <- hmm_data_fixed %>% filter(grepl("br23011", ID))
+p1 <- ggplot(data = bird_subset, aes(x = x, y = y, color = ID, group = ID)) +
+  geom_path(linewidth = 1) +
+  geom_point(size = 0.2, alpha = 0.6) +
+  coord_equal() +
+  theme_minimal() +
+  scale_color_viridis_d(option = "turbo") +
+  labs(x = "Easting (X) in Meters",
+       y = "Northing (Y) in Meters") +
+  theme(legend.position = "none", plot.title = element_text(face = "bold", size = 14))
+print(p1)
+```
+
+```{r}
+library(momentuHMM)
+min_points <- 10 
+
+# Filter out any ID groups that don't meet the threshold
+hmm_data_filtered <- hmm_data_fixed %>%
+  group_by(ID) %>%
+  filter(n() >= min_points) %>%
+  ungroup()
+
+#crawlWrap to regularize GPS track to equal interval.
+crw_out <- crawlWrap(obsData = hmm_data_filtered, 
+                     timeStep = "1 hour", 
+                     attempts = 70) #force the model to try multiple starting values if it gets stuck. resistant to crashing.
+
+# prepData automatically calculates the metrics you need for HMM
+model_ready_data <- prepData(data = crw_out)
+#write.csv(model_ready_data, "/Users/yjkang/Desktop/HMM_Ready_eastMongolia_Crane.csv", row.names = FALSE)
+```
+
+```{r}
+#Convert UTM coordinates into continuous spatial lines per bird
+crane_lines <- model_ready_data %>%
+  filter(grepl("br22063", ID)) %>% #br23018 #br22064
+  # Sort chronologically to ensure the line doesn't zigzag backward
+  arrange(ID, time) %>% 
+  # Tell R these are UTM Zone 49N meters (EPSG 32649)
+  st_as_sf(coords = c("x", "y"), crs = 32649) %>%
+  # Transform back to Longitude/Latitude (EPSG 4326) for the map axes
+  st_transform(crs = 4326) %>%
+  # Group by individual bird and connect their dots into a single line
+  group_by(ID) %>%
+  summarize(do_union = FALSE) %>%
+  st_cast("MULTIPOINT") #POINT #LINESTRING
+```
+
+```{r}
+library(rnaturalearth)
+
+basemap <- ne_countries(scale = "medium", returnclass = "sf")
+bbox <- st_bbox(crane_lines) # Calculate the bounding box of data, figures out the exact zoom level needed
+
+# 5. Build the static map
+static_map <- ggplot() +
+  geom_sf(data = basemap, fill = "gray95", color = "gray70") +
+  geom_sf(data = crane_lines, aes(color = as.factor(ID)), size=0.05, alpha = 0.3) + #linewidth = 0.8
+  
+  # Zoom exactly to your data, adding a 2-degree padding margin so lines don't hit the edge
+  coord_sf(xlim = c(bbox["xmin"] - 2, bbox["xmax"] + 2),
+           ylim = c(bbox["ymin"] - 2, bbox["ymax"] + 2),
+           expand = FALSE) +
+  theme_bw() +
+  scale_color_viridis_d(option = "turbo") +
+  labs(title = "Regularized Migratory Trajectories",
+      x = "Longitude",
+      y = "Latitude") +
+  theme(legend.position = "none", 
+        panel.grid.major = element_line(color = "gray90", linetype = "dashed"),
+        plot.title = element_text(face = "bold", size = 14))
+print(static_map)
+#ggsave("/Users/yjkang/Desktop/Crane_Trajectory_Map.png", plot = static_map, width = 8, height = 8, dpi = 500)
+```
+
+=======================
+HMM behaviour modeling
+=======================
+```{r, fig.height=3, fig.width=4}
+crane_subset <- model_ready_data #%>% filter(grepl("br22064", ID))
+raw_crane <- crane_subset %>% select(ID, time, x, y)
+raw_crane$time <- as.POSIXct(raw_crane$time, tz = "UTC")
+crane_data <- prepData(raw_crane)
+crane_data$step <- crane_data$step / 1000 #convert to kilometers
+crane_data$step[crane_data$step == 0] <- 0.0001 #GPS jitter can cause 0. We shift it by 1 meter. (step=Gamma distrib=always positive)
+
+# Find where the step length is mathematically identical (the crawl straight lines)
+is_interpolated <- c(FALSE, abs(diff(crane_data$step)) < 1e-5)
+crane_data$step[is_interpolated] <- NA # Set the fake mathematical steps to NA
+crane_data$angle[is_interpolated] <- NA
+cat("\nNeutralized", sum(is_interpolated, na.rm = TRUE), "straight-line artifacts.\n")
+
+hist(log(crane_data$step), breaks = 100)
+hist(crane_data$angle, breaks = 100)
+print(sum(crane_data$step == 0, na.rm = TRUE))
+```
+
+# ==========================================
+# The 3-State Model (Migrating, Foraging, Roosting)
+# ==========================================
+```{r}
+#Distribution type
+#step=Gamma distrib, angle=Von Mises distrib
+dist <- list(step = "gamma", angle = "vm")
+
+#Parameters 
+stepPar0_3  <- c(
+  45.0, 2.0, 0.02,   # Means: Migration (45km), Foraging (2km), Roosting (20m)
+  10.0, 1.5, 0.01 )  # SDs
+anglePar0_3 <- c(
+  8.0, 0.5, 0.1 )   # Concentrations: Migration 5.0 (highly directional), Foraging 0.5 (zigzagging), Roosting 0.1 (random/flat)
+Par0_3 <- list(step = stepPar0_3, angle = anglePar0_3)
+
+m3 <- fitHMM(#nlmPar = list(print.level = 2),
+             data = crane_data, nbStates = 3, dist = dist, Par0 = Par0_3)
+```
+
+# ==========================================
+# DECODING BEHAVIOR (The Viterbi Algorithm)
+# ==========================================
+```{r}
+# Viterbi algorithm to assign State 1, 2, or 3 to every single row.
+crane_data$Behavior_State <- viterbi(m3)
+crane_data$Behavior_Name <- factor(crane_data$Behavior_State, 
+                                   levels = c(1, 2, 3), 
+                                   labels = c("Migrating", "Foraging", "Roosting"))
+print(table(crane_data$Behavior_Name))
+#write.csv(crane_data, "/Users/yjkang/Desktop/HMMoutput_Crane_Behavior.csv", row.names = FALSE)
+
+# Plot Gamma and Von Mises distributions
+plot(m3, plotTracks = FALSE, ask = FALSE)
+```
+
+```{r}
+crane_sf_utm <- st_as_sf(crane_data, coords = c("x", "y"), crs = 32649)
+crane_sf_deg <- st_transform(crane_sf_utm, crs = 4326)
+coords_deg <- st_coordinates(crane_sf_deg)
+crane_data$lon <- coords_deg[, "X"]
+crane_data$lat <- coords_deg[, "Y"]
+
+p_hmm_result <- ggplot() +
+  geom_sf(data = basemap, fill = "gray95", color = "gray70") +
+  geom_path(data = crane_data, aes(x = lon, y = lat), color = "dodgerblue3", linewidth = 0.3, alpha=0.3) +
+  geom_sf(data = crane_sf_deg, aes(color = Behavior_Name), size = 0.05, alpha = 0.8) +
+  coord_sf(xlim = c(126.5, 127.8), ylim = c(37.5, 38.5), expand = FALSE) +
+  #coord_sf(xlim = c(min(crane_data$lon)-2, max(crane_data$lon)+2.5), 
+  #         ylim = c(min(crane_data$lat)-1, max(crane_data$lat)+1), expand = FALSE) +
+  theme_bw() +
+  scale_color_manual(values = c("Migrating" = "blue", 
+                                "Foraging"  = "red", 
+                                "Roosting"  = "black")) +
+  labs(title = "HMM Classified Behaviors",
+       x = "Longitude",
+       y = "Latitude",
+       color = NULL) + # Removes the legend title
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        plot.title = element_text(size = 14, hjust = 0.5),
+        panel.background = element_rect(fill = "aliceblue"))
+print(p_hmm_result)
+#ggsave("/Users/yjkang/Desktop/craneTraj_HMM.png", plot = p_hmm_result, width = 12, height = 5, dpi = 500)
+```
+```{r, fig.width=7, fig.height=3}
+crane_angles <- subset(crane_data, !is.na(angle) & !is.na(Behavior_Name))
+
+p_rose <- ggplot(crane_angles, aes(x = angle, fill = Behavior_Name)) +
+  geom_histogram(bins = 80, color = NA, alpha = 0.8, linewidth = 0.1) +
+  coord_polar(start = pi, clip = "off") + 
+  facet_wrap(~ Behavior_Name) + 
+  theme_minimal() +
+  scale_fill_manual(values = c("Migrating" = "darkblue", 
+                               "Foraging"  = "red", 
+                               "Roosting"  = "grey15")) +
+  scale_x_continuous(limits = c(-pi, pi),
+                     breaks = c(-pi, -pi/2, 0, pi/2),
+                     labels = c("±π\nBack", "-π/2\nLeft", "0", "π/2\nRight")) +
+  scale_y_sqrt() +
+  labs(title = "Turning Angle Distributions",
+       x = NULL, y = NULL) +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 12, hjust = 0.5),
+        strip.text = element_text(size = 11, face = "bold"),
+        panel.spacing = unit(2, "lines"),
+        panel.grid = element_line(color = "grey75", linewidth = 0.3),
+        axis.text.y = element_blank(), # Hide the confusing grid numbers
+        axis.ticks.y = element_blank())
+print(p_rose)
+#ggsave("/Users/yjkang/Desktop/craneAngle_HMM.png", plot = p_rose, width = 7, height = 3, dpi = 500)
+```
+
+
+
